@@ -1,0 +1,9 @@
+flask
+ultralytics
+opencv-python-headless
+numpy
+matplotlib
+seaborn
+psutil
+torch
+gunicorn
