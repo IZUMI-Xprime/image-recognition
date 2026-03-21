@@ -1696,5 +1696,5 @@ def api_analyse_download(job_id: str):
 if __name__ == "__main__":
     reconnect_stream()
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
+    #port = int(os.environ.get("PORT", 5000))
+    #app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
