@@ -1,0 +1,29 @@
+# Secrets
+.env
+run_sentinel.bat
+*.bat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Cython build artifacts
+tracker_cy.c
+tracker_cy.html
+tracker_cy*.so
+tracker_cy*.pyd
+
+# App data
+videos/
+uploads/
+heatmap.png
+bytetrack_sentinel.yaml
+
+# IDE
+.vscode/
+.idea/
