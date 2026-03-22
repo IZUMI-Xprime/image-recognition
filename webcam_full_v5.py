@@ -108,12 +108,31 @@ CHUNK_SIZE        = 4 * 1024 * 1024          # 4 MB chunks for streaming upload
 UPLOAD_TIMEOUT    = 7200                     # 2 hours max upload time (seconds)
 
 IOU_THRESHOLD     = float(os.environ.get("IOU_THRESHOLD",   "0.35"))
-MAX_ABSENT_FRAMES = int(os.environ.get("MAX_ABSENT_FRAMES",  "30"))
+MAX_ABSENT_FRAMES = int(os.environ.get("MAX_ABSENT_FRAMES",  "90"))   # 90 ≈ 10s at 9fps
 CONF_THRESHOLD    = float(os.environ.get("CONF_THRESHOLD",   "0.40"))
-FRAME_SKIP        = int(os.environ.get("FRAME_SKIP",         "1"))   # analyse every Nth frame
+FRAME_SKIP        = int(os.environ.get("FRAME_SKIP",         "3"))
+
+# ByteTrack buffer — how many frames a track survives without a match
+# At 8-9 fps, 90 frames = ~10 seconds before an individual is "forgotten"
+# Increase this if the same person re-entering is being counted twice
+TRACK_BUFFER      = int(os.environ.get("TRACK_BUFFER", "90"))
 
 os.makedirs(VIDEO_DIR,  exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Write a custom ByteTrack config with extended track_buffer so tracks
+# survive longer between frames — prevents re-entry being counted as new person
+_BYTETRACK_CFG = "bytetrack_sentinel.yaml"
+with open(_BYTETRACK_CFG, "w") as _f:
+    _f.write(f"""# Sentinel ByteTrack config — extended buffer for slow cameras
+tracker_type: bytetrack
+track_high_thresh: 0.5      # min confidence to start a new track
+track_low_thresh: 0.1       # low-confidence detections still used for matching
+new_track_thresh: 0.6       # min confidence to create a brand-new track
+track_buffer: {TRACK_BUFFER} # frames a track survives without matching (90 = ~10s at 9fps)
+match_thresh: 0.8           # IoU threshold for first-round matching
+fuse_score: true
+""")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Flask — NOTE: NO MAX_CONTENT_LENGTH — we stream to disk instead
@@ -151,17 +170,17 @@ def err_500(e):
     return jsonify(error="Internal server error"), 500
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YOLO models — two separate instances so live stream and video analysis
-# NEVER share a lock and never block each other.
+# YOLO segmentation models — yolov8n-seg gives polygon outlines instead of boxes
+# Two separate instances: live stream and video analysis never share a lock.
 # ─────────────────────────────────────────────────────────────────────────────
-model_stream   = YOLO("yolov8n.pt")   # live webcam feed
-model_analysis = YOLO("yolov8n.pt")   # uploaded video analysis
+model_stream   = YOLO("yolov8n-seg.pt")   # live webcam feed  — segmentation
+model_analysis = YOLO("yolov8n-seg.pt")   # uploaded video    — segmentation
 model_stream.to(DEVICE)
 model_analysis.to(DEVICE)
 _stream_lock   = Lock()               # guards model_stream only
 _analysis_lock = Lock()               # guards model_analysis only
 
-# aliases so existing heatmap/stream code works unchanged
+# aliases so heatmap route works unchanged
 model       = model_stream
 _model_lock = _stream_lock
 
@@ -174,13 +193,14 @@ _analysis_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analysis"
 # ─────────────────────────────────────────────────────────────────────────────
 # Live-stream state
 # ─────────────────────────────────────────────────────────────────────────────
-_state_lock     = Lock()
-animal_counts   = {}
-last_email_time = 0.0
-cap             = None
-video_writer    = None
-clip_start_time = None
-last_clip_path  = None
+_state_lock      = Lock()
+animal_counts    = {}          # {label: unique_individual_count}
+seen_track_ids   = set()       # track IDs already counted — never double-count
+last_email_time  = 0.0
+cap              = None
+video_writer     = None
+clip_start_time  = None
+last_clip_path   = None
 
 # Camera on/off control
 cam_active      = True          # toggled by /api/cam/start|stop
@@ -304,24 +324,33 @@ class UniqueAnimalTracker:
 # ─────────────────────────────────────────────────────────────────────────────
 def _infer_batch(frames: list) -> list:
     """
-    Run YOLO on a batch of frames using the dedicated analysis model.
-    Never touches model_stream — no lock contention with the live feed.
+    Run segmentation inference on a batch of frames.
+    Returns list of (dets, masks_xy) per frame:
+      dets     : [(label, x1,y1,x2,y2), …]
+      masks_xy : [np.ndarray(N,2), …]  — one polygon per detection
     """
-    all_dets = []
+    all_results = []
     with _analysis_lock:
         for i in range(0, len(frames), BATCH_SIZE):
             chunk   = frames[i:i + BATCH_SIZE]
             results = model_analysis(chunk, verbose=False,
                                      conf=CONF_THRESHOLD, device=DEVICE)
             for result in results:
-                dets = []
-                for box in result.boxes:
+                dets      = []
+                masks_xy  = []
+                has_masks = result.masks is not None
+
+                for j, box in enumerate(result.boxes):
                     cls_id = int(box.cls[0])
                     label  = model_analysis.names.get(cls_id, str(cls_id))
                     x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
                     dets.append((label, x1, y1, x2, y2))
-                all_dets.append(dets)
-    return all_dets
+                    masks_xy.append(
+                        result.masks.xy[j] if has_masks and j < len(result.masks.xy)
+                        else None
+                    )
+                all_results.append((dets, masks_xy))
+    return all_results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,15 +385,21 @@ def _analyse_video(job_id: str, video_path: str) -> None:
             nonlocal frames_done
             if not batch_frames:
                 return
-            all_dets = _infer_batch(batch_frames)
-            for frame, dets in zip(batch_frames, all_dets):
+            all_results = _infer_batch(batch_frames)
+            for frame, (dets, masks_xy) in zip(batch_frames, all_results):
                 tracker.update(dets)
-                for (label, x1, y1, x2, y2) in dets:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 230, 100), 2)
-                    cv2.putText(frame, label, (x1, max(y1-8, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                                (0, 230, 100), 1, cv2.LINE_AA)
-                # Burn unique counts into frame
+                for idx, (label, x1, y1, x2, y2) in enumerate(dets):
+                    colour   = (0, 230, 100)   # consistent green for analysis output
+                    mask     = masks_xy[idx] if idx < len(masks_xy) else None
+                    if mask is not None and len(mask) >= 3:
+                        _draw_seg(frame, mask, colour, label)
+                    else:
+                        # Fallback box if mask missing
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+                        cv2.putText(frame, label, (x1, max(y1 - 8, 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                                    colour, 1, cv2.LINE_AA)
+                # Burn unique counts into top-left corner
                 y_off = 24
                 cv2.putText(frame, "Unique:",
                             (10, y_off), cv2.FONT_HERSHEY_SIMPLEX,
@@ -509,6 +544,41 @@ def _finalize_clip(video_path, counts):
     _send_email(counts)
 
 
+def _draw_seg(frame: np.ndarray,
+              mask_xy: np.ndarray,
+              colour: tuple,
+              label: str,
+              alpha: float = 0.35) -> None:
+    """
+    Draw a segmentation polygon outline + semi-transparent fill on `frame`.
+
+    mask_xy : (N,2) float array of polygon points in pixel coords
+              (ultralytics result.masks.xy[i])
+    colour  : BGR tuple — unique per track ID
+    alpha   : fill opacity (0 = outline only, 1 = solid fill)
+    """
+    if mask_xy is None or len(mask_xy) < 3:
+        return
+
+    pts = mask_xy.astype(np.int32).reshape((-1, 1, 2))
+
+    # Semi-transparent fill
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [pts], colour)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    # Solid outline — 2px, crisp
+    cv2.polylines(frame, [pts], isClosed=True, color=colour,
+                  thickness=2, lineType=cv2.LINE_AA)
+
+    # Label at the topmost point of the mask
+    top_pt = tuple(pts[pts[:, 0, 1].argmin()][0])
+    lx = max(top_pt[0], 4)
+    ly = max(top_pt[1] - 8, 14)
+    cv2.putText(frame, label, (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, colour, 1, cv2.LINE_AA)
+
+
 def generate_frames():
     """
     Live MJPEG stream with:
@@ -517,7 +587,7 @@ def generate_frames():
     • perf metrics              — FPS, inference ms, GPU util updated every frame
     • max FPS on GPU            — no artificial sleep, JPEG quality tuned for throughput
     """
-    global cap, animal_counts, video_writer, clip_start_time, last_clip_path
+    global cap, animal_counts, seen_track_ids, video_writer, clip_start_time, last_clip_path
 
     # Blank "camera stopped" frame sent when cam is paused
     _blank = None
@@ -552,37 +622,49 @@ def generate_frames():
             track_results = model_stream.track(
                 frame, verbose=False, device=DEVICE,
                 conf=CONF_THRESHOLD,
-                tracker="bytetrack.yaml",   # built into ultralytics
-                persist=True,               # keep tracklet state between calls
+                tracker=_BYTETRACK_CFG,   # custom config with extended track_buffer
+                persist=True,
             )
 
         infer_ms = (time.perf_counter() - t0) * 1000
 
-        # ── Count unique track IDs per class in this frame ────────────────────
-        frame_counts: dict[str, int] = {}
+        # ── Count only NEW track IDs — same ID seen again = same individual ──
+        new_detections: dict[str, int] = {}
+        frame_has_detections = False
+
         if track_results and track_results[0].boxes.id is not None:
-            boxes  = track_results[0].boxes
+            result   = track_results[0]
+            boxes    = result.boxes
+            masks    = result.masks   # None if model didn't return masks
+
             for i in range(len(boxes)):
                 cls_id   = int(boxes.cls[i])
                 label    = model_stream.names.get(cls_id, "?")
                 conf     = float(boxes.conf[i])
                 track_id = int(boxes.id[i])
-                x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[i])
+                colour   = _track_colour(track_id)
 
-                # colour by track ID so each individual gets its own colour
-                colour = _track_colour(track_id)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-                cv2.putText(frame, f"{label} #{track_id} {conf:.2f}",
-                            (x1, max(y1 - 8, 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.46, colour, 1, cv2.LINE_AA)
+                frame_has_detections = True
 
-                frame_counts[label] = frame_counts.get(label, 0) + 1
+                if masks is not None and i < len(masks.xy):
+                    # Segmentation path — polygon outline + fill
+                    _draw_seg(frame, masks.xy[i], colour,
+                              f"{label} #{track_id} {conf:.2f}")
+                else:
+                    # Fallback to box if mask unavailable for this detection
+                    x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[i])
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+                    cv2.putText(frame, f"{label} #{track_id} {conf:.2f}",
+                                (x1, max(y1 - 8, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, colour, 1,
+                                cv2.LINE_AA)
 
-        # ── Update global counts ──────────────────────────────────────────────
-        if frame_counts:
-            with _state_lock:
-                for k, v in frame_counts.items():
-                    animal_counts[k] = animal_counts.get(k, 0) + v
+                # Only count this individual if we've NEVER seen this track ID
+                with _state_lock:
+                    if track_id not in seen_track_ids:
+                        seen_track_ids.add(track_id)
+                        animal_counts[label] = animal_counts.get(label, 0) + 1
+                        new_detections[label] = new_detections.get(label, 0) + 1
 
         # ── Timestamp overlay ─────────────────────────────────────────────────
         ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
@@ -594,7 +676,7 @@ def generate_frames():
         with _state_lock:
             writer_active = video_writer is not None
 
-        if frame_counts and not writer_active:
+        if frame_has_detections and not writer_active:
             fname = os.path.join(VIDEO_DIR,
                                  datetime.now().strftime("clip_%Y%m%d_%H%M%S.mp4"))
             nw = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (w, h))
@@ -612,8 +694,11 @@ def generate_frames():
 
         if clip_due:
             with _state_lock:
-                path = last_clip_path; counts = dict(animal_counts)
-                animal_counts.clear(); clip_start_time = None
+                path = last_clip_path
+                counts = dict(animal_counts)
+                animal_counts.clear()
+                seen_track_ids.clear()   # new clip = new session, reset seen IDs
+                clip_start_time = None
             _io_pool.submit(_finalize_clip, path, counts)
 
         # ── Performance metrics ───────────────────────────────────────────────
@@ -660,18 +745,42 @@ def _track_colour(track_id: int) -> tuple:
     return (b, g, r)   # OpenCV is BGR
 
 
-def build_heatmap(frame, bboxes):
-    hmap = np.zeros(frame.shape[:2], dtype=np.float32)
-    for (x1, y1, x2, y2) in bboxes:
-        hmap[y1:y2, x1:x2] += 1.0
+def build_heatmap(frame: np.ndarray, masks_xy: list) -> str:
+    """
+    Build a detection heatmap overlaid on the camera frame.
+    Saved at native camera resolution — CSS scales it to 50% of stream width.
+    """
+    h, w = frame.shape[:2]
+    hmap = np.zeros((h, w), dtype=np.float32)
+
+    for mask in masks_xy:
+        if mask is None or len(mask) < 3:
+            continue
+        pts = mask.astype(np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(hmap, [pts], 1.0)
+
+    sigma = max(w // 25, 8)
     if hmap.max() > 0:
+        hmap = cv2.GaussianBlur(hmap, (0, 0), sigmaX=sigma, sigmaY=sigma)
         hmap /= hmap.max()
-    fig, ax = plt.subplots(
-        figsize=(frame.shape[1]/100, frame.shape[0]/100), dpi=100)
-    sns.heatmap(hmap, ax=ax, cmap="jet", alpha=0.8, cbar=False)
+
+    # BGR → RGB — critical, prevents colour inversion
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Figure at exact camera pixel size — CSS does the display scaling
+    dpi = 72
+    fig, ax = plt.subplots(1, 1, figsize=(w / dpi, h / dpi), dpi=dpi)
+    fig.patch.set_facecolor("#0b1218")
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    ax.imshow(frame_rgb, aspect="auto")
+    ax.imshow(hmap, cmap="jet", alpha=0.5, vmin=0, vmax=1,
+              interpolation="bilinear", aspect="auto")
     ax.axis("off")
+
     path = os.path.join(UPLOAD_DIR, "heatmap.png")
-    fig.savefig(path, bbox_inches="tight", pad_inches=0)
+    fig.savefig(path, bbox_inches="tight", pad_inches=0,
+                facecolor=fig.get_facecolor(), dpi=dpi)
     plt.close(fig)
     return path
 
@@ -798,15 +907,20 @@ main{padding:1.8rem;overflow-y:auto}
 .perf-bar-bg{height:3px;background:var(--border);border-radius:2px;margin-top:.4rem;overflow:hidden}
 .perf-bar{height:100%%;border-radius:2px;transition:width .5s}
 /* grid */
-.grid2{display:grid;grid-template-columns:1fr 360px;gap:1.4rem}
-@media(max-width:960px){.grid2{grid-template-columns:1fr}}
 .panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.stream-panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px}
 .panel-head{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;
             border-bottom:1px solid var(--border);font-size:.75rem;font-family:var(--font-mono);
             letter-spacing:.07em;text-transform:uppercase;color:var(--textdim)}
 .title-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:.5rem;box-shadow:0 0 6px var(--accent)}
-.stream-wrap{position:relative;background:#000;aspect-ratio:16/9}
-.stream-wrap img{width:100%%;height:100%%;object-fit:cover;display:block}
+/* ── Main layout: left column (stream+heatmap) | right column (detections) ── */
+.grid2{display:grid;grid-template-columns:2fr 1fr;gap:1.2rem;align-items:start}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+/* ── Left column inner: stream on top, heatmap at exactly half height below ── */
+.left-col{display:flex;flex-direction:column;gap:1.2rem;min-width:0}
+/* ── Stream: fixed 55vw wide, natural height from camera aspect ratio ── */
+.stream-wrap{position:relative;background:#000;width:100%;overflow:hidden;line-height:0}
+.stream-wrap img{display:block;width:100%;height:auto}
 .stream-overlay{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;
                 justify-content:space-between;padding:.5rem .8rem;pointer-events:none;
                 background:linear-gradient(to bottom,rgba(5,10,14,.8),transparent)}
@@ -816,7 +930,13 @@ main{padding:1.8rem;overflow-y:auto}
 .stream-ts{font-family:var(--font-mono);font-size:.68rem;color:rgba(200,221,232,.5)}
 .cam-stopped-badge{font-size:.7rem;font-family:var(--font-mono);color:var(--warn);
                    display:none;align-items:center;gap:.4rem}
-.det-list{max-height:300px;overflow-y:auto}
+/* ── Heatmap: exactly 50%% width of its container, centred ── */
+.heatmap-outer{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.heatmap-wrap{padding:.5rem;background:#000;display:flex;justify-content:center;line-height:0}
+.heatmap-wrap img{display:block;width:50%%;height:auto;border-radius:3px}
+/* ── Right column: detections panel ── */
+.right-col{display:flex;flex-direction:column;gap:1.2rem;min-width:0}
+.det-list{max-height:500px;overflow-y:auto}
 .det-list::-webkit-scrollbar{width:4px}
 .det-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 .det-row{display:flex;align-items:center;justify-content:space-between;padding:.6rem 1.2rem;
@@ -824,8 +944,6 @@ main{padding:1.8rem;overflow-y:auto}
 .det-row:last-child{border-bottom:none}
 .det-count{font-weight:700;color:var(--accent);font-family:var(--font-mono)}
 .det-empty{padding:1.4rem;text-align:center;color:var(--textdim);font-size:.8rem;font-family:var(--font-mono)}
-.heatmap-wrap{padding:1rem;background:#000;min-height:160px;display:flex;align-items:center;justify-content:center}
-.heatmap-wrap img{max-width:100%%;border-radius:4px}
 .controls{display:flex;gap:.7rem;padding:.9rem 1.2rem;border-top:1px solid var(--border);flex-wrap:wrap;align-items:center}
 .btn-stop{background:rgba(255,71,87,.15);color:var(--danger);border:1px solid rgba(255,71,87,.3)}
 .btn-stop:hover{background:rgba(255,71,87,.25)}
@@ -894,14 +1012,13 @@ main{padding:1.8rem;overflow-y:auto}
   </div>
 
   <div class="grid2">
-    <div>
-      <div class="panel">
+    <!-- Left column: stream on top, heatmap (half size) below -->
+    <div class="left-col">
+      <div class="stream-panel">
         <div class="panel-head">
           <div style="display:flex;align-items:center">
             <div class="title-dot"></div>Live Feed
-            <span class="cam-stopped-badge" id="stopped-badge" style="margin-left:.8rem">
-              ■ STOPPED
-            </span>
+            <span class="cam-stopped-badge" id="stopped-badge" style="margin-left:.8rem">■ STOPPED</span>
           </div>
           <span class="tag tag-green">ByteTrack</span>
         </div>
@@ -920,23 +1037,25 @@ main{padding:1.8rem;overflow-y:auto}
           <button class="btn btn-ghost" onclick="clearCounts()">Clear Counts</button>
         </div>
       </div>
+      <!-- Heatmap at 50% width of the stream above it -->
+      <div class="heatmap-outer">
+        <div class="panel-head">
+          <div style="display:flex;align-items:center"><div class="title-dot"></div>Detection Heatmap</div>
+          <span class="tag tag-blue">Seg masks</span>
+        </div>
+        <div class="heatmap-wrap">
+          <img id="heatmap-img" src="/heatmap" alt="Heatmap" onerror="this.style.display='none'">
+        </div>
+      </div>
     </div>
-    <div style="display:flex;flex-direction:column;gap:1.2rem">
+    <!-- Right column: detections panel -->
+    <div class="right-col">
       <div class="panel">
         <div class="panel-head">
           <div style="display:flex;align-items:center"><div class="title-dot"></div>Detections</div>
           <span class="tag tag-blue" id="badge-counts">0 classes</span>
         </div>
         <div class="det-list" id="det-list"><div class="det-empty">Waiting for detections…</div></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head">
-          <div style="display:flex;align-items:center"><div class="title-dot"></div>Heatmap</div>
-          <span class="tag tag-blue">Latest</span>
-        </div>
-        <div class="heatmap-wrap">
-          <img id="heatmap-img" src="/heatmap" alt="Heatmap" onerror="this.style.display='none'">
-        </div>
       </div>
     </div>
   </div>
@@ -1521,14 +1640,29 @@ def heatmap():
     ret, frame = cap.read()
     if not ret:
         return jsonify(error="Camera unavailable"), 503
+
     with _model_lock:
         results = model(frame, verbose=False, device=DEVICE)
-    bboxes = [
-        (int(b.xyxy[0][0]), int(b.xyxy[0][1]),
-         int(b.xyxy[0][2]), int(b.xyxy[0][3]))
-        for r in results for b in r.boxes
-    ]
-    return send_file(build_heatmap(frame, bboxes), mimetype="image/png")
+
+    # Extract polygon masks from segmentation results
+    masks_xy = []
+    for r in results:
+        if r.masks is not None:
+            for poly in r.masks.xy:
+                masks_xy.append(poly)
+        else:
+            # model returned no masks — fall back to box-centre dot
+            for b in r.boxes:
+                x1, y1, x2, y2 = (int(v) for v in b.xyxy[0])
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                # synthesise a small polygon around centroid
+                r2 = max((x2 - x1) // 4, 8)
+                masks_xy.append(np.array([
+                    [cx - r2, cy - r2], [cx + r2, cy - r2],
+                    [cx + r2, cy + r2], [cx - r2, cy + r2],
+                ], dtype=np.float32))
+
+    return send_file(build_heatmap(frame, masks_xy), mimetype="image/png")
 
 # ── Live-stream JSON API ──────────────────────────────────────────────────────
 @app.route("/api/counts")
@@ -1548,6 +1682,7 @@ def api_clip_count():
 def api_clear_counts():
     with _state_lock:
         animal_counts.clear()
+        seen_track_ids.clear()   # reset so new individuals are counted fresh
     return jsonify({"ok": True})
 
 # ── Camera control ────────────────────────────────────────────────────────────
@@ -1696,5 +1831,4 @@ def api_analyse_download(job_id: str):
 if __name__ == "__main__":
     reconnect_stream()
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    #port = int(os.environ.get("PORT", 5000))
-    #app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
+    app.run(debug=debug, host="0.0.0.0", port=5000, threaded=True)
