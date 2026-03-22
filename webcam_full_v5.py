@@ -170,11 +170,13 @@ def err_500(e):
     return jsonify(error="Internal server error"), 500
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YOLO segmentation models — yolov8n-seg gives polygon outlines instead of boxes
+# YOLO segmentation models
+# yolov8s-seg (small) gives significantly better mask accuracy than nano.
 # Two separate instances: live stream and video analysis never share a lock.
 # ─────────────────────────────────────────────────────────────────────────────
-model_stream   = YOLO("yolov8n-seg.pt")   # live webcam feed  — segmentation
-model_analysis = YOLO("yolov8n-seg.pt")   # uploaded video    — segmentation
+_SEG_MODEL     = os.environ.get("SEG_MODEL", "yolov8s-seg.pt")   # override via env
+model_stream   = YOLO(_SEG_MODEL)   # live webcam feed
+model_analysis = YOLO(_SEG_MODEL)   # uploaded video analysis
 model_stream.to(DEVICE)
 model_analysis.to(DEVICE)
 _stream_lock   = Lock()               # guards model_stream only
@@ -324,32 +326,44 @@ class UniqueAnimalTracker:
 # ─────────────────────────────────────────────────────────────────────────────
 def _infer_batch(frames: list) -> list:
     """
-    Run segmentation inference on a batch of frames.
-    Returns list of (dets, masks_xy) per frame:
-      dets     : [(label, x1,y1,x2,y2), …]
-      masks_xy : [np.ndarray(N,2), …]  — one polygon per detection
+    Run ByteTrack segmentation on a list of frames using model_analysis.
+    Uses model_analysis.track() with persist=True so track IDs are consistent
+    across the entire video — same individual = same ID = counted once.
+
+    Returns list of (track_dets, masks_xy) per frame:
+      track_dets : [(label, track_id, x1,y1,x2,y2, conf), …]
+      masks_xy   : [np.ndarray(N,2) or None, …]
     """
     all_results = []
     with _analysis_lock:
-        for i in range(0, len(frames), BATCH_SIZE):
-            chunk   = frames[i:i + BATCH_SIZE]
-            results = model_analysis(chunk, verbose=False,
-                                     conf=CONF_THRESHOLD, device=DEVICE)
-            for result in results:
-                dets      = []
-                masks_xy  = []
+        for frame in frames:
+            # track() with persist=True maintains ByteTrack state across calls
+            results = model_analysis.track(
+                frame, verbose=False, conf=CONF_THRESHOLD, device=DEVICE,
+                tracker=_BYTETRACK_CFG, persist=True,
+            )
+            track_dets = []
+            masks_xy   = []
+
+            if results and results[0].boxes.id is not None:
+                result    = results[0]
+                boxes     = result.boxes
                 has_masks = result.masks is not None
 
-                for j, box in enumerate(result.boxes):
-                    cls_id = int(box.cls[0])
-                    label  = model_analysis.names.get(cls_id, str(cls_id))
-                    x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                    dets.append((label, x1, y1, x2, y2))
+                for j in range(len(boxes)):
+                    cls_id   = int(boxes.cls[j])
+                    label    = model_analysis.names.get(cls_id, str(cls_id))
+                    track_id = int(boxes.id[j])
+                    conf     = float(boxes.conf[j])
+                    x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[j])
+                    track_dets.append((label, track_id, x1, y1, x2, y2, conf))
                     masks_xy.append(
-                        result.masks.xy[j] if has_masks and j < len(result.masks.xy)
+                        result.masks.xy[j]
+                        if has_masks and j < len(result.masks.xy)
                         else None
                     )
-                all_results.append((dets, masks_xy))
+
+            all_results.append((track_dets, masks_xy))
     return all_results
 
 
@@ -357,6 +371,13 @@ def _infer_batch(frames: list) -> list:
 # Video analysis worker
 # ─────────────────────────────────────────────────────────────────────────────
 def _analyse_video(job_id: str, video_path: str) -> None:
+    """
+    Process uploaded video with ByteTrack + seen_track_ids.
+    Same counting logic as the live stream:
+      - Each track_id counted exactly once per species
+      - Unique colour per track_id so viewer can verify visually
+      - Label shows species + track ID + confidence
+    """
     with _jobs_lock:
         _jobs[job_id]["status"] = "processing"
 
@@ -374,46 +395,16 @@ def _analyse_video(job_id: str, video_path: str) -> None:
         fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
         writer   = cv2.VideoWriter(out_path, fourcc,
                                    max(1.0, fps / FRAME_SKIP), (w, h))
-        tracker  = UniqueAnimalTracker()
 
-        frame_idx       = 0
-        frames_done     = 0
-        batch_frames    = []   # raw frames buffered for GPU batch
-        batch_indices   = []   # their original positions (for writer order)
+        # ── Counting state (mirrors live stream logic exactly) ─────────────────
+        job_seen_ids: set[int]      = set()        # track IDs already counted
+        job_counts:   dict[str,int] = {}           # {label: unique_count}
 
-        def _flush_batch():
-            nonlocal frames_done
-            if not batch_frames:
-                return
-            all_results = _infer_batch(batch_frames)
-            for frame, (dets, masks_xy) in zip(batch_frames, all_results):
-                tracker.update(dets)
-                for idx, (label, x1, y1, x2, y2) in enumerate(dets):
-                    colour   = (0, 230, 100)   # consistent green for analysis output
-                    mask     = masks_xy[idx] if idx < len(masks_xy) else None
-                    if mask is not None and len(mask) >= 3:
-                        _draw_seg(frame, mask, colour, label)
-                    else:
-                        # Fallback box if mask missing
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-                        cv2.putText(frame, label, (x1, max(y1 - 8, 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                                    colour, 1, cv2.LINE_AA)
-                # Burn unique counts into top-left corner
-                y_off = 24
-                cv2.putText(frame, "Unique:",
-                            (10, y_off), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (0, 200, 255), 1, cv2.LINE_AA)
-                for lbl, cnt in tracker.unique.items():
-                    y_off += 18
-                    cv2.putText(frame, f"  {lbl}: {cnt}",
-                                (10, y_off), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.45, (0, 200, 255), 1, cv2.LINE_AA)
-                writer.write(frame)
-                frames_done += 1
-            batch_frames.clear()
-            batch_indices.clear()
+        frame_idx   = 0
+        frames_done = 0
 
+        # ByteTrack needs persist=True and processes one frame at a time
+        # (batch tracking breaks track continuity — each batch would restart IDs)
         while True:
             ret, frame = cap_v.read()
             if not ret:
@@ -423,25 +414,55 @@ def _analyse_video(job_id: str, video_path: str) -> None:
             if frame_idx % FRAME_SKIP != 0:
                 continue
 
-            batch_frames.append(frame)
-            batch_indices.append(frame_idx)
+            # Run ByteTrack on this single frame (persist keeps state across calls)
+            track_dets, masks_xy = _infer_batch([frame])[0]
 
-            # Flush when batch is full
-            if len(batch_frames) >= BATCH_SIZE:
-                _flush_batch()
+            for idx, (label, track_id, x1, y1, x2, y2, conf) in enumerate(track_dets):
+                colour = _track_colour(track_id)
+                mask   = masks_xy[idx] if idx < len(masks_xy) else None
+
+                # Draw segmentation polygon or fallback box
+                disp_label = f"{label} #{track_id} {conf:.2f}"
+                if mask is not None and len(mask) >= 3:
+                    _draw_seg(frame, mask, colour, disp_label)
+                else:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+                    cv2.putText(frame, disp_label,
+                                (x1, max(y1 - 8, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                                colour, 1, cv2.LINE_AA)
+
+                # Count only on first sighting of this track ID
+                if track_id not in job_seen_ids:
+                    job_seen_ids.add(track_id)
+                    job_counts[label] = job_counts.get(label, 0) + 1
+
+            # Burn running unique counts into top-left corner
+            y_off = 24
+            cv2.putText(frame, "Unique individuals:",
+                        (10, y_off), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.48, (200, 200, 200), 1, cv2.LINE_AA)
+            for lbl, cnt in sorted(job_counts.items(), key=lambda x: x[1], reverse=True):
+                y_off += 19
+                colour_lbl = (200, 200, 200)
+                cv2.putText(frame, f"  {lbl}: {cnt}",
+                            (10, y_off), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.44, colour_lbl, 1, cv2.LINE_AA)
+
+            writer.write(frame)
+            frames_done += 1
 
             # Progress
             pct = int(frame_idx / max(total_frames, 1) * 100)
             with _jobs_lock:
                 _jobs[job_id]["progress"] = pct
 
-        _flush_batch()   # remainder
         cap_v.release()
         writer.release()
 
         species_data = [
             {"species": lbl, "count": cnt}
-            for lbl, cnt in sorted(tracker.unique.items(),
+            for lbl, cnt in sorted(job_counts.items(),
                                    key=lambda x: x[1], reverse=True)
         ]
 
@@ -455,14 +476,24 @@ def _analyse_video(job_id: str, video_path: str) -> None:
                 "out_path":        out_path,
                 "device":          DEVICE,
             })
-        log.info("Job %s done: %s", job_id, species_data)
+        log.info("Job %s done — %d unique individuals: %s",
+                 job_id, sum(job_counts.values()), species_data)
+
+        # ── Send annotated video to Telegram ──────────────────────────────────
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            caption_lines = ["🦅 *Video Analysis Complete*\n"]
+            caption_lines.append(f"Total unique individuals: *{sum(job_counts.values())}*")
+            caption_lines.append(f"Species found: *{len(species_data)}*\n")
+            for sp in species_data:
+                caption_lines.append(f"• {sp['species'].capitalize()}: {sp['count']}")
+            caption = "\n".join(caption_lines)
+            _io_pool.submit(_send_telegram_video, out_path, caption)
 
     except Exception as exc:
         log.exception("Job %s failed", job_id)
         with _jobs_lock:
             _jobs[job_id].update({"status": "error", "error": str(exc)})
     finally:
-        # Clean up the raw upload to save disk space
         try:
             if os.path.exists(video_path):
                 os.remove(video_path)
@@ -525,9 +556,38 @@ async def _telegram_async(path):
 
 
 def _send_telegram(path):
+    """Send a video clip to Telegram (no caption — used for live clips)."""
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(_telegram_async(path))
+    finally:
+        loop.close()
+
+
+async def _telegram_video_async(path: str, caption: str) -> None:
+    """Async Telegram video send with a caption string."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    from telegram import Bot, InputFile
+    bot = Bot(token=TELEGRAM_TOKEN)
+    try:
+        with open(path, "rb") as f:
+            await bot.send_video(
+                chat_id=TELEGRAM_CHAT_ID,
+                video=InputFile(f, filename=os.path.basename(path)),
+                caption=caption,
+                parse_mode="Markdown",
+            )
+        log.info("Telegram: analysis video sent.")
+    except Exception as exc:
+        log.error("Telegram analysis send failed: %s", exc)
+
+
+def _send_telegram_video(path: str, caption: str) -> None:
+    """Thread-safe Telegram sender with caption — used for analysis results."""
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_telegram_video_async(path, caption))
     finally:
         loop.close()
 
@@ -550,33 +610,47 @@ def _draw_seg(frame: np.ndarray,
               label: str,
               alpha: float = 0.35) -> None:
     """
-    Draw a segmentation polygon outline + semi-transparent fill on `frame`.
-
-    mask_xy : (N,2) float array of polygon points in pixel coords
-              (ultralytics result.masks.xy[i])
-    colour  : BGR tuple — unique per track ID
-    alpha   : fill opacity (0 = outline only, 1 = solid fill)
+    Draw segmentation polygon + semi-transparent fill + clearly visible label.
+    Label has a solid background pill so it's readable on any background.
     """
     if mask_xy is None or len(mask_xy) < 3:
         return
 
+    h, w = frame.shape[:2]
     pts = mask_xy.astype(np.int32).reshape((-1, 1, 2))
 
-    # Semi-transparent fill
+    # ── Semi-transparent fill ─────────────────────────────────────────────────
     overlay = frame.copy()
     cv2.fillPoly(overlay, [pts], colour)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-    # Solid outline — 2px, crisp
+    # ── Solid outline ─────────────────────────────────────────────────────────
     cv2.polylines(frame, [pts], isClosed=True, color=colour,
                   thickness=2, lineType=cv2.LINE_AA)
 
-    # Label at the topmost point of the mask
-    top_pt = tuple(pts[pts[:, 0, 1].argmin()][0])
-    lx = max(top_pt[0], 4)
-    ly = max(top_pt[1] - 8, 14)
-    cv2.putText(frame, label, (lx, ly),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, colour, 1, cv2.LINE_AA)
+    # ── Label with solid background pill ─────────────────────────────────────
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.52
+    thickness  = 1
+    padding    = 4
+
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    # Place label above the topmost mask point, clamped inside frame
+    top_pt = pts[pts[:, 0, 1].argmin()][0]
+    lx = int(np.clip(top_pt[0], 0, w - tw - padding * 2 - 2))
+    ly = int(np.clip(top_pt[1] - 10, th + padding + 4, h - padding - 4))
+
+    # Solid background rectangle
+    cv2.rectangle(frame,
+                  (lx - padding, ly - th - padding),
+                  (lx + tw + padding, ly + baseline + padding),
+                  colour, cv2.FILLED)
+
+    # White text on coloured background — always readable
+    cv2.putText(frame, label,
+                (lx, ly),
+                font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def generate_frames():
@@ -799,35 +873,74 @@ def login_required(f):
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS shared
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS + HTML TEMPLATES
+# ─────────────────────────────────────────────────────────────────────────────
 _BASE_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=DM+Mono:wght@400;500&display=swap');
+
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
 :root{
-  --bg:#050a0e;--bg2:#0b1218;--bg3:#111c24;--border:#1a2d3a;
-  --accent:#00e5a0;--accent2:#00b8d9;--danger:#ff4757;--warn:#ffa502;
-  --text:#c8dde8;--textdim:#4a6a7c;
-  --font-ui:'Syne',sans-serif;--font-mono:'Space Mono',monospace;
+  --white:      #ffffff;
+  --bg:         #f5f4f1;
+  --bg2:        #ffffff;
+  --bg3:        #f0efe9;
+  --border:     #e2e0d8;
+  --border2:    #d0cdc3;
+  --ink:        #1a1916;
+  --ink2:       #4a4840;
+  --ink3:       #8c897f;
+  --sage:       #3d6b52;
+  --sage-l:     #eef4f0;
+  --sage-m:     #c5dccb;
+  --amber:      #b5620a;
+  --amber-l:    #fef3e2;
+  --rose:       #b03a2e;
+  --rose-l:     #fdf0ee;
+  --blue:       #2c5f8a;
+  --blue-l:     #edf3f9;
+  --shadow:     0 1px 3px rgba(26,25,22,.06), 0 4px 16px rgba(26,25,22,.04);
+  --shadow-md:  0 2px 8px rgba(26,25,22,.08), 0 8px 32px rgba(26,25,22,.06);
+  --r:          10px;
+  --r-sm:       6px;
+  --font:       'DM Sans', sans-serif;
+  --mono:       'DM Mono', monospace;
 }
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-ui)}
-a{color:var(--accent);text-decoration:none}
-.btn{display:inline-flex;align-items:center;gap:.5rem;padding:.55rem 1.4rem;
-     border-radius:4px;border:none;font-family:var(--font-mono);font-size:.78rem;
-     letter-spacing:.06em;cursor:pointer;transition:.15s}
-.btn-primary{background:var(--accent);color:#050a0e;font-weight:700}
-.btn-primary:hover{background:#00ffb3}
-.btn-primary:disabled{opacity:.4;cursor:not-allowed}
-.btn-ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
-.btn-ghost:hover{background:rgba(0,229,160,.08)}
-input,select{width:100%;padding:.65rem 1rem;border-radius:4px;border:1px solid var(--border);
-  background:var(--bg3);color:var(--text);font-family:var(--font-mono);font-size:.85rem;
-  outline:none;transition:border-color .2s}
-input:focus{border-color:var(--accent)}
-.tag{display:inline-block;padding:.18rem .6rem;border-radius:3px;
-     font-family:var(--font-mono);font-size:.72rem;letter-spacing:.04em}
-.tag-green{background:rgba(0,229,160,.12);color:var(--accent)}
-.tag-blue{background:rgba(0,184,217,.12);color:var(--accent2)}
-.tag-red{background:rgba(255,71,87,.12);color:var(--danger)}
-.tag-warn{background:rgba(255,165,2,.12);color:var(--warn)}
+
+html,body{height:100%;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--sage);text-decoration:none}
+a:hover{color:var(--ink)}
+
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1.2rem;border-radius:var(--r-sm);
+     border:1px solid transparent;font-family:var(--font);font-size:.82rem;font-weight:500;
+     cursor:pointer;transition:all .15s;white-space:nowrap;letter-spacing:.01em}
+.btn-primary{background:var(--sage);color:#fff;border-color:var(--sage)}
+.btn-primary:hover{background:#2f5340;border-color:#2f5340}
+.btn-primary:disabled{opacity:.45;cursor:not-allowed}
+.btn-outline{background:var(--white);color:var(--ink2);border-color:var(--border2)}
+.btn-outline:hover{background:var(--bg3);border-color:var(--border2);color:var(--ink)}
+.btn-danger{background:var(--white);color:var(--rose);border-color:var(--border2)}
+.btn-danger:hover{background:var(--rose-l);border-color:var(--rose)}
+
+input,select{width:100%;padding:.6rem .9rem;border-radius:var(--r-sm);
+  border:1px solid var(--border2);background:var(--white);color:var(--ink);
+  font-family:var(--font);font-size:.9rem;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus{border-color:var(--sage);box-shadow:0 0 0 3px rgba(61,107,82,.12)}
+
+.badge{display:inline-flex;align-items:center;gap:.3rem;padding:.2rem .65rem;border-radius:20px;
+       font-size:.74rem;font-weight:500;letter-spacing:.02em}
+.badge-sage{background:var(--sage-l);color:var(--sage);border:1px solid var(--sage-m)}
+.badge-amber{background:var(--amber-l);color:var(--amber)}
+.badge-rose{background:var(--rose-l);color:var(--rose)}
+.badge-blue{background:var(--blue-l);color:var(--blue)}
+.badge-neutral{background:var(--bg3);color:var(--ink2);border:1px solid var(--border)}
+
+.card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow)}
+.card-head{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1.25rem;
+           border-bottom:1px solid var(--border)}
+.card-title{font-size:.78rem;font-weight:600;color:var(--ink2);letter-spacing:.04em;text-transform:uppercase}
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -835,39 +948,119 @@ input:focus{border-color:var(--accent)}
 # ─────────────────────────────────────────────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sentinel — Login</title>
+<title>Sentinel — Sign In</title>
 <style>""" + _BASE_CSS + """
-body{display:flex;align-items:center;justify-content:center;min-height:100vh;
-     background:radial-gradient(ellipse 80%% 60%% at 50%% 0%%,#051a14 0%%,var(--bg) 70%%)}
-.card{width:380px;padding:2.8rem 2.4rem;background:var(--bg2);border:1px solid var(--border);
-      border-radius:8px;box-shadow:0 0 60px rgba(0,229,160,.06);animation:fadeup .5s ease both}
-@keyframes fadeup{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
-.logo{font-size:1.1rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;
-      color:var(--accent);margin-bottom:.3rem}
-.sub{font-size:.8rem;color:var(--textdim);margin-bottom:2rem;font-family:var(--font-mono)}
+body{display:flex;min-height:100vh;background:var(--bg)}
+
+/* Left panel — illustration side */
+.left-panel{
+  flex:0 0 42%%;background:var(--sage);display:flex;flex-direction:column;
+  justify-content:space-between;padding:3rem;position:relative;overflow:hidden
+}
+.left-panel::before{
+  content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse 120%% 80%% at 110%% 110%%,rgba(255,255,255,.06) 0%%,transparent 60%%);
+  pointer-events:none
+}
+.brand{display:flex;align-items:center;gap:.7rem}
+.brand-icon{width:34px;height:34px;background:rgba(255,255,255,.15);border-radius:8px;
+            display:flex;align-items:center;justify-content:center;font-size:1.1rem}
+.brand-name{font-size:1rem;font-weight:600;color:#fff;letter-spacing:.02em}
+.left-body{flex:1;display:flex;flex-direction:column;justify-content:center;padding:2rem 0}
+.left-headline{font-size:2rem;font-weight:300;color:#fff;line-height:1.25;margin-bottom:1rem;letter-spacing:-.02em}
+.left-headline strong{font-weight:600;display:block}
+.left-sub{font-size:.88rem;color:rgba(255,255,255,.65);line-height:1.65;max-width:300px}
+.left-dots{display:flex;gap:.5rem}
+.left-dot{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.3)}
+.left-dot.active{background:#fff}
+
+/* Right panel — form */
+.right-panel{flex:1;display:flex;align-items:center;justify-content:center;padding:2rem}
+.form-card{width:100%%;max-width:380px}
+.form-top{margin-bottom:2.5rem}
+.form-title{font-size:1.5rem;font-weight:600;color:var(--ink);letter-spacing:-.02em;margin-bottom:.35rem}
+.form-sub{font-size:.87rem;color:var(--ink3)}
 .field{margin-bottom:1.2rem}
-.field label{display:block;font-size:.75rem;color:var(--textdim);font-family:var(--font-mono);
-             letter-spacing:.08em;text-transform:uppercase;margin-bottom:.45rem}
-.submit{width:100%%;margin-top:.4rem;padding:.75rem;font-size:.85rem}
-.err{background:rgba(255,71,87,.1);border:1px solid rgba(255,71,87,.3);color:var(--danger);
-     padding:.65rem 1rem;border-radius:4px;font-size:.8rem;font-family:var(--font-mono);margin-bottom:1.2rem}
-.glow-line{height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);
-           margin-bottom:2rem;opacity:.4}
+.field label{display:block;font-size:.8rem;font-weight:500;color:var(--ink2);margin-bottom:.4rem}
+.submit{width:100%%;padding:.7rem;font-size:.9rem;font-weight:500;margin-top:.4rem}
+.err{display:flex;align-items:center;gap:.5rem;padding:.6rem .9rem;background:var(--rose-l);
+     border:1px solid rgba(176,58,46,.2);border-radius:var(--r-sm);color:var(--rose);
+     font-size:.82rem;margin-bottom:1.2rem}
+
+@media(max-width:700px){.left-panel{display:none}.right-panel{padding:1.5rem}}
+@keyframes fadein{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+.form-card{animation:fadein .4s ease both}
 </style></head><body>
-<div class="card">
-  <div class="logo">⬡ Sentinel</div>
-  <div class="sub">Wildlife Monitoring System</div>
-  <div class="glow-line"></div>
-  {% if error %}<div class="err">{{ error }}</div>{% endif %}
-  <form method="POST">
-    <div class="field"><label>Username</label>
-      <input type="text" name="username" autocomplete="username" required autofocus></div>
-    <div class="field"><label>Password</label>
-      <input type="password" name="password" autocomplete="current-password" required></div>
-    <button class="btn btn-primary submit" type="submit">Access System</button>
-  </form>
+
+<div class="left-panel">
+  <div class="brand">
+    <div class="brand-icon">🦅</div>
+    <span class="brand-name">Sentinel</span>
+  </div>
+  <div class="left-body">
+    <div class="left-headline">Wildlife<strong>Monitoring</strong>System</div>
+    <p class="left-sub">Real-time detection, unique individual tracking, and deep video analysis — powered by YOLOv8 and ByteTrack.</p>
+  </div>
+  <div class="left-dots">
+    <div class="left-dot active"></div>
+    <div class="left-dot"></div>
+    <div class="left-dot"></div>
+  </div>
+</div>
+
+<div class="right-panel">
+  <div class="form-card">
+    <div class="form-top">
+      <div class="form-title">Sign in</div>
+      <div class="form-sub">Access your monitoring dashboard</div>
+    </div>
+    {% if error %}
+    <div class="err">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/><path d="M8 5v3.5M8 11v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      {{ error }}
+    </div>
+    {% endif %}
+    <form method="POST">
+      <div class="field">
+        <label>Username</label>
+        <input type="text" name="username" autocomplete="username" required autofocus placeholder="admin">
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" name="password" autocomplete="current-password" required placeholder="••••••••">
+      </div>
+      <button class="btn btn-primary submit" type="submit">Continue</button>
+    </form>
+  </div>
 </div>
 </body></html>
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED NAV (injected into dashboard + analyse + recordings)
+# ─────────────────────────────────────────────────────────────────────────────
+_NAV_CSS = """
+nav{
+  height:56px;background:var(--white);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 2rem;position:sticky;top:0;z-index:100;
+  box-shadow:0 1px 0 var(--border)
+}
+.nav-brand{display:flex;align-items:center;gap:.6rem;font-weight:600;font-size:.95rem;color:var(--ink)}
+.nav-icon{width:28px;height:28px;background:var(--sage);border-radius:7px;
+          display:flex;align-items:center;justify-content:center;font-size:.85rem}
+.nav-links{display:flex;align-items:center;gap:.2rem}
+.nav-link{padding:.38rem .85rem;border-radius:var(--r-sm);font-size:.84rem;font-weight:500;
+          color:var(--ink2);transition:.15s;cursor:pointer;text-decoration:none}
+.nav-link:hover{background:var(--bg3);color:var(--ink)}
+.nav-link.active{background:var(--sage-l);color:var(--sage)}
+.nav-right{display:flex;align-items:center;gap:.8rem}
+.nav-sep{width:1px;height:18px;background:var(--border)}
+.device-pill{font-size:.74rem;font-weight:500;padding:.22rem .7rem;border-radius:20px;
+             background:var(--blue-l);color:var(--blue);border:1px solid rgba(44,95,138,.15)}
+.nav-logout{font-size:.82rem;color:var(--ink3);font-weight:500;text-decoration:none;
+            padding:.38rem .7rem;border-radius:var(--r-sm);transition:.15s}
+.nav-logout:hover{background:var(--bg3);color:var(--ink)}
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -876,122 +1069,136 @@ body{display:flex;align-items:center;justify-content:center;min-height:100vh;
 DASHBOARD_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sentinel — Dashboard</title>
-<style>""" + _BASE_CSS + """
-body{display:grid;grid-template-rows:56px 1fr;min-height:100vh}
-nav{display:flex;align-items:center;justify-content:space-between;padding:0 1.8rem;
-    border-bottom:1px solid var(--border);background:var(--bg2);position:sticky;top:0;z-index:100}
-.nav-logo{font-weight:800;font-size:1rem;letter-spacing:.1em;text-transform:uppercase;
-          color:var(--accent);display:flex;align-items:center;gap:.5rem}
-.nav-logo span{width:9px;height:9px;background:var(--accent);border-radius:50%;
-               box-shadow:0 0 8px var(--accent);animation:pulse 2s infinite}
-@keyframes pulse{0%%,100%%{opacity:1;transform:scale(1)}50%%{opacity:.5;transform:scale(.8)}}
-.nav-links{display:flex;align-items:center;gap:1rem}
-.nav-links a{font-size:.8rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.05em;transition:color .2s}
-.nav-links a:hover,.nav-links a.active{color:var(--accent)}
-.nav-sep{width:1px;height:18px;background:var(--border)}
-.gpu-badge{font-size:.68rem;font-family:var(--font-mono);padding:.2rem .6rem;border-radius:3px;
-           background:rgba(0,184,217,.1);color:var(--accent2);border:1px solid rgba(0,184,217,.2)}
-main{padding:1.8rem;overflow-y:auto}
-@keyframes fadeup{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-/* stats row */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:1rem;margin-bottom:1.4rem}
-.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:1rem 1.2rem;animation:fadeup .4s ease both}
-.stat-label{font-size:.68rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.1em;text-transform:uppercase;margin-bottom:.45rem}
-.stat-value{font-size:1.5rem;font-weight:800;color:var(--text);line-height:1}
-.stat-value.green{color:var(--accent)}.stat-value.blue{color:var(--accent2)}.stat-value.warn{color:var(--warn)}
-/* perf row */
-.perf-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.7rem;margin-bottom:1.4rem}
-.perf-card{background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:.7rem 1rem}
-.perf-label{font-size:.65rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.1em;text-transform:uppercase;margin-bottom:.3rem}
-.perf-val{font-size:1.1rem;font-weight:700;font-family:var(--font-mono);color:var(--accent2)}
-.perf-bar-bg{height:3px;background:var(--border);border-radius:2px;margin-top:.4rem;overflow:hidden}
-.perf-bar{height:100%%;border-radius:2px;transition:width .5s}
-/* grid */
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
-.stream-panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px}
-.panel-head{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;
-            border-bottom:1px solid var(--border);font-size:.75rem;font-family:var(--font-mono);
-            letter-spacing:.07em;text-transform:uppercase;color:var(--textdim)}
-.title-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:.5rem;box-shadow:0 0 6px var(--accent)}
-/* ── Main layout: left column (stream+heatmap) | right column (detections) ── */
-.grid2{display:grid;grid-template-columns:2fr 1fr;gap:1.2rem;align-items:start}
-@media(max-width:900px){.grid2{grid-template-columns:1fr}}
-/* ── Left column inner: stream on top, heatmap at exactly half height below ── */
-.left-col{display:flex;flex-direction:column;gap:1.2rem;min-width:0}
-/* ── Stream: fixed 55vw wide, natural height from camera aspect ratio ── */
-.stream-wrap{position:relative;background:#000;width:100%;overflow:hidden;line-height:0}
-.stream-wrap img{display:block;width:100%;height:auto}
+<style>""" + _BASE_CSS + _NAV_CSS + """
+body{display:grid;grid-template-rows:56px 1fr;min-height:100vh;background:var(--bg)}
+main{padding:1.75rem 2rem;overflow-y:auto}
+
+/* ── Stat cards ── */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:1.5rem}
+.stat-card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);
+           padding:1.1rem 1.3rem;box-shadow:var(--shadow)}
+.stat-label{font-size:.73rem;font-weight:600;color:var(--ink3);letter-spacing:.05em;
+            text-transform:uppercase;margin-bottom:.5rem}
+.stat-value{font-size:1.65rem;font-weight:600;color:var(--ink);line-height:1;letter-spacing:-.02em}
+.stat-value.sage{color:var(--sage)}
+.stat-value.amber{color:var(--amber)}
+.stat-value.rose{color:var(--rose)}
+
+/* ── Perf row ── */
+.perf-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:.75rem;margin-bottom:1.5rem}
+.perf-card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);
+           padding:.8rem 1rem;box-shadow:var(--shadow)}
+.perf-label{font-size:.7rem;font-weight:600;color:var(--ink3);letter-spacing:.05em;
+            text-transform:uppercase;margin-bottom:.3rem}
+.perf-val{font-size:1rem;font-weight:600;font-family:var(--mono);color:var(--ink);letter-spacing:-.01em}
+.perf-bar-bg{height:2px;background:var(--border);border-radius:1px;margin-top:.5rem}
+.perf-bar{height:100%%;border-radius:1px;transition:width .6s}
+
+/* ── Main grid ── */
+.grid-main{display:grid;grid-template-columns:2fr 1fr;gap:1.25rem;align-items:start}
+@media(max-width:960px){.grid-main{grid-template-columns:1fr}}
+
+/* ── Left column ── */
+.left-col{display:flex;flex-direction:column;gap:1.25rem}
+
+/* ── Stream ── */
+.stream-panel{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
+.stream-wrap{position:relative;background:#0f0f0d;overflow:hidden;line-height:0}
+.stream-wrap img{display:block;width:100%%;height:auto}
 .stream-overlay{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;
-                justify-content:space-between;padding:.5rem .8rem;pointer-events:none;
-                background:linear-gradient(to bottom,rgba(5,10,14,.8),transparent)}
-.rec-badge{display:flex;align-items:center;gap:.35rem;font-size:.7rem;font-family:var(--font-mono);color:var(--danger)}
-.rec-dot{width:7px;height:7px;border-radius:50%;background:var(--danger);animation:blink 1s infinite}
-@keyframes blink{0%%,100%%{opacity:1}50%%{opacity:.2}}
-.stream-ts{font-family:var(--font-mono);font-size:.68rem;color:rgba(200,221,232,.5)}
-.cam-stopped-badge{font-size:.7rem;font-family:var(--font-mono);color:var(--warn);
-                   display:none;align-items:center;gap:.4rem}
-/* ── Heatmap: exactly 50%% width of its container, centred ── */
-.heatmap-outer{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
-.heatmap-wrap{padding:.5rem;background:#000;display:flex;justify-content:center;line-height:0}
-.heatmap-wrap img{display:block;width:50%%;height:auto;border-radius:3px}
-/* ── Right column: detections panel ── */
-.right-col{display:flex;flex-direction:column;gap:1.2rem;min-width:0}
-.det-list{max-height:500px;overflow-y:auto}
-.det-list::-webkit-scrollbar{width:4px}
-.det-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.det-row{display:flex;align-items:center;justify-content:space-between;padding:.6rem 1.2rem;
-         border-bottom:1px solid var(--border);font-size:.82rem;transition:background .15s}
+                justify-content:space-between;padding:.6rem .9rem;pointer-events:none;
+                background:linear-gradient(to bottom,rgba(0,0,0,.55),transparent)}
+.rec-badge{display:flex;align-items:center;gap:.35rem;font-size:.72rem;font-weight:600;
+           color:#fff;letter-spacing:.04em;font-family:var(--mono)}
+.rec-dot{width:6px;height:6px;border-radius:50%;background:#ef4444;animation:blink 1.2s infinite}
+@keyframes blink{0%%,100%%{opacity:1}50%%{opacity:.25}}
+.stream-ts{font-family:var(--mono);font-size:.68rem;color:rgba(255,255,255,.5)}
+.cam-stopped{display:none;align-items:center;gap:.4rem;font-size:.72rem;font-weight:600;
+             color:var(--amber);letter-spacing:.04em}
+.cam-stopped-dot{width:6px;height:6px;border-radius:50%;background:var(--amber)}
+.stream-controls{display:flex;gap:.6rem;padding:.9rem 1.1rem;border-top:1px solid var(--border);flex-wrap:wrap}
+
+/* ── Heatmap ── */
+.heatmap-panel{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
+.heatmap-body{background:#0f0f0d;padding:.5rem;display:flex;justify-content:center}
+.heatmap-body img{display:block;width:50%%;height:auto;border-radius:4px}
+
+/* ── Right column ── */
+.right-col{display:flex;flex-direction:column;gap:1.25rem}
+.det-panel{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
+.det-list{max-height:480px;overflow-y:auto}
+.det-list::-webkit-scrollbar{width:3px}
+.det-list::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+.det-row{display:flex;align-items:center;justify-content:space-between;padding:.65rem 1.25rem;
+         border-bottom:1px solid var(--border);transition:background .12s}
 .det-row:last-child{border-bottom:none}
-.det-count{font-weight:700;color:var(--accent);font-family:var(--font-mono)}
-.det-empty{padding:1.4rem;text-align:center;color:var(--textdim);font-size:.8rem;font-family:var(--font-mono)}
-.controls{display:flex;gap:.7rem;padding:.9rem 1.2rem;border-top:1px solid var(--border);flex-wrap:wrap;align-items:center}
-.btn-stop{background:rgba(255,71,87,.15);color:var(--danger);border:1px solid rgba(255,71,87,.3)}
-.btn-stop:hover{background:rgba(255,71,87,.25)}
-.btn-start{background:rgba(0,229,160,.15);color:var(--accent);border:1px solid rgba(0,229,160,.3)}
-.btn-start:hover{background:rgba(0,229,160,.25)}
+.det-row:hover{background:var(--bg)}
+.det-name{font-size:.85rem;font-weight:500;color:var(--ink);text-transform:capitalize}
+.det-count{font-family:var(--mono);font-size:.82rem;font-weight:500;color:var(--sage);
+           background:var(--sage-l);padding:.15rem .55rem;border-radius:20px;
+           border:1px solid var(--sage-m)}
+.det-empty{padding:2rem;text-align:center;color:var(--ink3);font-size:.85rem}
 </style></head><body>
+
 <nav>
-  <div class="nav-logo"><span></span>Sentinel</div>
+  <div class="nav-brand">
+    <div class="nav-icon">🦅</div>
+    Sentinel
+  </div>
   <div class="nav-links">
-    <a href="/dashboard" class="active">Dashboard</a>
-    <a href="/analyse">Analyse Video</a>
-    <a href="/recordings">Recordings</a>
+    <a href="/dashboard" class="nav-link active">Dashboard</a>
+    <a href="/analyse"   class="nav-link">Analyse</a>
+    <a href="/recordings" class="nav-link">Recordings</a>
+  </div>
+  <div class="nav-right">
+    <span class="device-pill" id="gpu-badge">{{ device }}</span>
     <div class="nav-sep"></div>
-    <span class="gpu-badge" id="gpu-badge">{{ device }}</span>
-    <div class="nav-sep"></div>
-    <a href="/logout">Logout</a>
+    <a href="/logout" class="nav-logout">Sign out</a>
   </div>
 </nav>
+
 <main>
-  <!-- Detection stats -->
+  <!-- Stats -->
   <div class="stats">
-    <div class="stat-card"><div class="stat-label">Total Detections</div><div class="stat-value green" id="stat-total">—</div></div>
-    <div class="stat-card"><div class="stat-label">Unique Classes</div><div class="stat-value blue" id="stat-classes">—</div></div>
-    <div class="stat-card"><div class="stat-label">Clips Saved</div><div class="stat-value" id="stat-clips">—</div></div>
-    <div class="stat-card"><div class="stat-label">Camera</div><div class="stat-value green" id="stat-cam">LIVE</div></div>
+    <div class="stat-card">
+      <div class="stat-label">Unique detections</div>
+      <div class="stat-value sage" id="stat-total">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Species</div>
+      <div class="stat-value" id="stat-classes">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Clips saved</div>
+      <div class="stat-value" id="stat-clips">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Camera</div>
+      <div class="stat-value sage" id="stat-cam">Live</div>
+    </div>
   </div>
 
-  <!-- Performance row -->
+  <!-- Performance -->
   <div class="perf-row">
     <div class="perf-card">
       <div class="perf-label">FPS</div>
       <div class="perf-val" id="perf-fps">—</div>
-      <div class="perf-bar-bg"><div class="perf-bar" id="bar-fps" style="background:var(--accent);width:0%%"></div></div>
+      <div class="perf-bar-bg"><div class="perf-bar" id="bar-fps" style="background:var(--sage);width:0%%"></div></div>
     </div>
     <div class="perf-card">
       <div class="perf-label">Infer ms</div>
       <div class="perf-val" id="perf-ms">—</div>
-      <div class="perf-bar-bg"><div class="perf-bar" id="bar-ms" style="background:var(--accent2);width:0%%"></div></div>
+      <div class="perf-bar-bg"><div class="perf-bar" id="bar-ms" style="background:var(--blue);width:0%%"></div></div>
     </div>
     <div class="perf-card">
-      <div class="perf-label">GPU Mem</div>
+      <div class="perf-label">GPU mem</div>
       <div class="perf-val" id="perf-gmem">—</div>
-      <div class="perf-bar-bg"><div class="perf-bar" id="bar-gmem" style="background:var(--warn);width:0%%"></div></div>
+      <div class="perf-bar-bg"><div class="perf-bar" id="bar-gmem" style="background:var(--amber);width:0%%"></div></div>
     </div>
     <div class="perf-card">
-      <div class="perf-label">CPU %%</div>
+      <div class="perf-label">CPU</div>
       <div class="perf-val" id="perf-cpu">—</div>
-      <div class="perf-bar-bg"><div class="perf-bar" id="bar-cpu" style="background:var(--accent2);width:0%%"></div></div>
+      <div class="perf-bar-bg"><div class="perf-bar" id="bar-cpu" style="background:var(--blue);width:0%%"></div></div>
     </div>
     <div class="perf-card">
       <div class="perf-label">RAM</div>
@@ -1007,149 +1214,146 @@ main{padding:1.8rem;overflow-y:auto}
     </div>
     <div class="perf-card">
       <div class="perf-label">Tracker</div>
-      <div class="perf-val" id="perf-tracker" style="font-size:.8rem">—</div>
+      <div class="perf-val" id="perf-tracker" style="font-size:.75rem">—</div>
     </div>
   </div>
 
-  <div class="grid2">
-    <!-- Left column: stream on top, heatmap (half size) below -->
+  <!-- Main grid -->
+  <div class="grid-main">
     <div class="left-col">
+
+      <!-- Stream -->
       <div class="stream-panel">
-        <div class="panel-head">
-          <div style="display:flex;align-items:center">
-            <div class="title-dot"></div>Live Feed
-            <span class="cam-stopped-badge" id="stopped-badge" style="margin-left:.8rem">■ STOPPED</span>
+        <div class="card-head">
+          <div style="display:flex;align-items:center;gap:.75rem">
+            <span class="card-title">Live feed</span>
+            <span class="cam-stopped" id="stopped-badge"><span class="cam-stopped-dot"></span>Stopped</span>
           </div>
-          <span class="tag tag-green">ByteTrack</span>
+          <span class="badge badge-sage">ByteTrack</span>
         </div>
         <div class="stream-wrap">
           <img id="stream-img" src="/video_feed" alt="Live feed">
           <div class="stream-overlay">
-            <div class="rec-badge" id="rec-badge"><div class="rec-dot"></div>REC</div>
+            <div class="rec-badge" id="rec-badge"><span class="rec-dot"></span>REC</div>
             <div class="stream-ts" id="clock"></div>
           </div>
         </div>
-        <div class="controls">
-          <button class="btn btn-stop"  id="btn-stop"  onclick="camStop()">⏹ Stop</button>
-          <button class="btn btn-start" id="btn-start" onclick="camStart()" style="display:none">▶ Start</button>
-          <button class="btn btn-ghost" onclick="takeSnapshot()">📷 Snapshot</button>
-          <button class="btn btn-ghost" onclick="refreshHeatmap()">Heatmap</button>
-          <button class="btn btn-ghost" onclick="clearCounts()">Clear Counts</button>
+        <div class="stream-controls">
+          <button class="btn btn-danger" id="btn-stop"  onclick="camStop()">⏹ Stop</button>
+          <button class="btn btn-primary" id="btn-start" onclick="camStart()" style="display:none">▶ Resume</button>
+          <button class="btn btn-outline" onclick="takeSnapshot()">📷 Snapshot</button>
+          <button class="btn btn-outline" onclick="refreshHeatmap()">Refresh heatmap</button>
+          <button class="btn btn-outline" onclick="clearCounts()">Clear counts</button>
         </div>
       </div>
-      <!-- Heatmap at 50% width of the stream above it -->
-      <div class="heatmap-outer">
-        <div class="panel-head">
-          <div style="display:flex;align-items:center"><div class="title-dot"></div>Detection Heatmap</div>
-          <span class="tag tag-blue">Seg masks</span>
+
+      <!-- Heatmap -->
+      <div class="heatmap-panel">
+        <div class="card-head">
+          <span class="card-title">Detection heatmap</span>
+          <span class="badge badge-neutral">Segmentation masks</span>
         </div>
-        <div class="heatmap-wrap">
+        <div class="heatmap-body">
           <img id="heatmap-img" src="/heatmap" alt="Heatmap" onerror="this.style.display='none'">
         </div>
       </div>
+
     </div>
-    <!-- Right column: detections panel -->
+
+    <!-- Right: detections -->
     <div class="right-col">
-      <div class="panel">
-        <div class="panel-head">
-          <div style="display:flex;align-items:center"><div class="title-dot"></div>Detections</div>
-          <span class="tag tag-blue" id="badge-counts">0 classes</span>
+      <div class="det-panel">
+        <div class="card-head">
+          <span class="card-title">Detections</span>
+          <span class="badge badge-blue" id="badge-counts">0 species</span>
         </div>
-        <div class="det-list" id="det-list"><div class="det-empty">Waiting for detections…</div></div>
+        <div class="det-list" id="det-list">
+          <div class="det-empty">Waiting for detections…</div>
+        </div>
       </div>
     </div>
   </div>
 </main>
+
 <script>
-// ── Clock ─────────────────────────────────────────────────────────────────────
 function updateClock(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('en-GB',{hour12:false});}
 setInterval(updateClock,1000);updateClock();
 
-// ── Detection counts ──────────────────────────────────────────────────────────
 async function pollCounts(){
   try{
-    const data=await(await fetch('/api/counts')).json();
-    const entries=Object.entries(data);
-    const total=entries.reduce((a,[,v])=>a+v,0);
-    document.getElementById('stat-total').textContent=total;
-    document.getElementById('stat-classes').textContent=entries.length;
-    document.getElementById('badge-counts').textContent=entries.length+' classes';
+    const d=await(await fetch('/api/counts')).json();
+    const e=Object.entries(d);
+    const total=e.reduce((a,[,v])=>a+v,0);
+    document.getElementById('stat-total').textContent=total||'0';
+    document.getElementById('stat-classes').textContent=e.length||'0';
+    document.getElementById('badge-counts').textContent=e.length+' species';
     const list=document.getElementById('det-list');
-    if(!entries.length){list.innerHTML='<div class="det-empty">Waiting…</div>';return;}
-    list.innerHTML=entries.sort((a,b)=>b[1]-a[1])
-      .map(([k,v])=>`<div class="det-row"><span style="font-family:var(--font-mono)">${k}</span><span class="det-count">${v}</span></div>`)
+    if(!e.length){list.innerHTML='<div class="det-empty">Waiting for detections…</div>';return;}
+    list.innerHTML=e.sort((a,b)=>b[1]-a[1])
+      .map(([k,v])=>`<div class="det-row"><span class="det-name">${k}</span><span class="det-count">${v}</span></div>`)
       .join('');
   }catch(_){}
 }
+
 async function pollClips(){
-  try{const d=await(await fetch('/api/clip_count')).json();document.getElementById('stat-clips').textContent=d.count;}catch(_){}
+  try{const d=await(await fetch('/api/clip_count')).json();document.getElementById('stat-clips').textContent=d.count||'0';}catch(_){}
 }
 
-// ── Performance ───────────────────────────────────────────────────────────────
 async function pollPerf(){
   try{
     const p=await(await fetch('/api/perf')).json();
-    setText('perf-fps',   p.fps+' fps');
-    setText('perf-ms',    p.infer_ms+' ms');
-    setText('perf-gmem',  p.gpu_mem_mb+' MB');
-    setText('perf-cpu',   p.cpu_pct+'%%');
-    setText('perf-ram',   Math.round(p.ram_mb)+' MB');
-    setText('perf-uptime',p.uptime_fmt);
-    setText('perf-frames',p.frame_count.toLocaleString());
-    setText('perf-tracker', p.cython ? 'Cython+ByteTrack' : 'PyIoU+ByteTrack');
-    setBar('bar-fps',  p.fps,  60);
-    setBar('bar-ms',   120-p.infer_ms, 120);
-    setBar('bar-gmem', p.gpu_mem_mb, 4096);
-    setBar('bar-cpu',  100-p.cpu_pct, 100);
-    document.getElementById('gpu-badge').textContent = p.gpu_name || p.device;
+    const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v;};
+    const bar=(id,v,mx)=>{const el=document.getElementById(id);if(el)el.style.width=Math.min(100,Math.max(0,v/mx*100))+'%%';};
+    set('perf-fps',   p.fps+' fps');
+    set('perf-ms',    p.infer_ms+' ms');
+    set('perf-gmem',  p.gpu_mem_mb+' MB');
+    set('perf-cpu',   p.cpu_pct+'%%');
+    set('perf-ram',   Math.round(p.ram_mb)+' MB');
+    set('perf-uptime',p.uptime_fmt);
+    set('perf-frames',p.frame_count.toLocaleString());
+    set('perf-tracker',p.cython?'Cython':'Pure Python');
+    bar('bar-fps', p.fps, 30);
+    bar('bar-ms',  Math.max(0,200-p.infer_ms), 200);
+    bar('bar-gmem',p.gpu_mem_mb, 4096);
+    bar('bar-cpu', 100-p.cpu_pct, 100);
+    const badge=document.getElementById('gpu-badge');
+    if(badge)badge.textContent=p.gpu_name||p.device;
   }catch(_){}
 }
-function setText(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
-function setBar(id,val,max){
-  const el=document.getElementById(id);
-  if(el)el.style.width=Math.min(100,Math.max(0,val/max*100))+'%%';
-}
 
-// ── Camera controls ───────────────────────────────────────────────────────────
 async function camStop(){
   await fetch('/api/cam/stop',{method:'POST'});
   document.getElementById('btn-stop').style.display='none';
   document.getElementById('btn-start').style.display='inline-flex';
-  document.getElementById('stat-cam').textContent='STOPPED';
-  document.getElementById('stat-cam').className='stat-value warn';
+  document.getElementById('stat-cam').textContent='Stopped';
+  document.getElementById('stat-cam').className='stat-value amber';
   document.getElementById('stopped-badge').style.display='flex';
-  document.getElementById('rec-badge').style.opacity='.3';
+  document.getElementById('rec-badge').style.opacity='.4';
 }
 async function camStart(){
   await fetch('/api/cam/start',{method:'POST'});
   document.getElementById('btn-stop').style.display='inline-flex';
   document.getElementById('btn-start').style.display='none';
-  document.getElementById('stat-cam').textContent='LIVE';
-  document.getElementById('stat-cam').className='stat-value green';
+  document.getElementById('stat-cam').textContent='Live';
+  document.getElementById('stat-cam').className='stat-value sage';
   document.getElementById('stopped-badge').style.display='none';
   document.getElementById('rec-badge').style.opacity='1';
-  // force stream img to reload
   const img=document.getElementById('stream-img');
   img.src='/video_feed?t='+Date.now();
 }
-async function takeSnapshot(){
-  window.open('/api/cam/snapshot','_blank');
-}
+function takeSnapshot(){window.open('/api/cam/snapshot','_blank');}
 function refreshHeatmap(){const i=document.getElementById('heatmap-img');i.src='/heatmap?t='+Date.now();i.style.display='block';}
 async function clearCounts(){await fetch('/api/clear_counts',{method:'POST'});pollCounts();}
 
-// ── Restore cam state on load ─────────────────────────────────────────────────
 (async()=>{
-  try{
-    const s=await(await fetch('/api/cam/status')).json();
+  try{const s=await(await fetch('/api/cam/status')).json();
     if(!s.active){
       document.getElementById('btn-stop').style.display='none';
       document.getElementById('btn-start').style.display='inline-flex';
-      document.getElementById('stat-cam').textContent='STOPPED';
-      document.getElementById('stat-cam').className='stat-value warn';
+      document.getElementById('stat-cam').textContent='Stopped';
+      document.getElementById('stat-cam').className='stat-value amber';
       document.getElementById('stopped-badge').style.display='flex';
-    }
-  }catch(_){}
+    }}catch(_){}
 })();
 
 setInterval(pollCounts,2000);
@@ -1161,300 +1365,243 @@ pollCounts();pollClips();pollPerf();
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSE PAGE
+# ANALYSE
 # ─────────────────────────────────────────────────────────────────────────────
 ANALYSE_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sentinel — Analyse Video</title>
-<style>""" + _BASE_CSS + """
-body{display:grid;grid-template-rows:56px 1fr;min-height:100vh}
-nav{display:flex;align-items:center;justify-content:space-between;padding:0 1.8rem;
-    border-bottom:1px solid var(--border);background:var(--bg2);position:sticky;top:0;z-index:100}
-.nav-logo{font-weight:800;font-size:1rem;letter-spacing:.1em;text-transform:uppercase;
-          color:var(--accent);display:flex;align-items:center;gap:.5rem}
-.nav-logo span{width:9px;height:9px;background:var(--accent);border-radius:50%;box-shadow:0 0 8px var(--accent)}
-.nav-links{display:flex;align-items:center;gap:1rem}
-.nav-links a{font-size:.8rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.05em;transition:color .2s}
-.nav-links a:hover,.nav-links a.active{color:var(--accent)}
-.nav-sep{width:1px;height:18px;background:var(--border)}
-.gpu-badge{font-size:.68rem;font-family:var(--font-mono);padding:.2rem .6rem;border-radius:3px;
-           background:rgba(0,184,217,.1);color:var(--accent2);border:1px solid rgba(0,184,217,.2)}
-main{padding:1.8rem;overflow-y:auto;max-width:880px;margin:0 auto}
-h1{font-size:1.05rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin-bottom:1.6rem}
+<title>Sentinel — Analyse</title>
+<style>""" + _BASE_CSS + _NAV_CSS + """
+body{display:grid;grid-template-rows:56px 1fr;min-height:100vh;background:var(--bg)}
+main{padding:1.75rem 2rem;overflow-y:auto;max-width:820px;margin:0 auto}
+h1{font-size:1.3rem;font-weight:600;color:var(--ink);letter-spacing:-.02em;margin-bottom:.3rem}
+.page-sub{font-size:.87rem;color:var(--ink3);margin-bottom:2rem}
 
-/* upload zone */
-.upload-zone{border:2px dashed var(--border);border-radius:8px;padding:3rem 2rem;
-  text-align:center;cursor:pointer;background:var(--bg2);transition:.2s;
-  animation:fadeup .4s ease both;position:relative}
-.upload-zone:hover,.upload-zone.drag{border-color:var(--accent);background:rgba(0,229,160,.03)}
-.upload-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%%;height:100%%}
-.upload-icon{font-size:2.5rem;margin-bottom:.8rem;opacity:.5}
-.upload-title{font-size:1rem;font-weight:600;margin-bottom:.4rem}
-.upload-sub{font-size:.78rem;color:var(--textdim);font-family:var(--font-mono)}
-.upload-chosen{font-size:.82rem;font-family:var(--font-mono);color:var(--accent);margin-top:.8rem;min-height:1.2rem}
-@keyframes fadeup{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+/* Upload zone */
+.drop-zone{
+  border:1.5px dashed var(--border2);border-radius:var(--r);padding:2.5rem 2rem;
+  text-align:center;cursor:pointer;background:var(--white);
+  transition:border-color .15s,background .15s;position:relative;box-shadow:var(--shadow)
+}
+.drop-zone:hover,.drop-zone.drag{border-color:var(--sage);background:var(--sage-l)}
+.drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%%;height:100%%}
+.drop-icon{font-size:2rem;margin-bottom:.8rem;opacity:.45}
+.drop-title{font-size:.95rem;font-weight:600;color:var(--ink);margin-bottom:.3rem}
+.drop-sub{font-size:.82rem;color:var(--ink3)}
+.drop-chosen{font-size:.82rem;font-weight:500;color:var(--sage);margin-top:.65rem;min-height:1rem}
+.drop-speed{font-size:.78rem;color:var(--ink3);margin-top:.2rem;font-family:var(--mono);min-height:1rem}
 
-/* upload speed */
-.upload-speed{font-size:.72rem;font-family:var(--font-mono);color:var(--textdim);
-              margin-top:.4rem;min-height:1rem}
+.controls-row{display:flex;gap:.75rem;margin-top:1.1rem;align-items:center;flex-wrap:wrap}
 
-.controls-row{display:flex;gap:.8rem;margin-top:1.2rem;align-items:center;flex-wrap:wrap}
-
-/* progress */
-.prog-wrap{margin-top:1.4rem;display:none}
+/* Progress */
+.prog-wrap{margin-top:1.5rem;display:none}
 .prog-wrap.show{display:block}
-.prog-label{font-size:.75rem;font-family:var(--font-mono);color:var(--textdim);
-            letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem;
-            display:flex;justify-content:space-between}
-.prog-bar-bg{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin-bottom:.3rem}
-.prog-bar{height:100%%;background:var(--accent);border-radius:3px;width:0%%;transition:width .4s}
-.prog-stage{font-size:.72rem;font-family:var(--font-mono);color:var(--textdim)}
+.prog-header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.5rem}
+.prog-label{font-size:.8rem;font-weight:600;color:var(--ink2)}
+.prog-pct{font-size:.8rem;font-family:var(--mono);color:var(--ink3)}
+.prog-bg{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-bottom:.4rem}
+.prog-bar{height:100%%;background:var(--sage);border-radius:2px;width:0%%;transition:width .4s}
+.prog-stage{font-size:.78rem;color:var(--ink3)}
 
-/* results */
-.results{margin-top:1.6rem;display:none}
+/* Results */
+.results{margin-top:1.75rem;display:none}
 .results.show{display:block}
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
-.panel-head{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;
-            border-bottom:1px solid var(--border);font-size:.75rem;font-family:var(--font-mono);
-            letter-spacing:.07em;text-transform:uppercase;color:var(--textdim)}
-.title-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:.5rem;box-shadow:0 0 6px var(--accent)}
-.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem;padding:1.2rem}
-.s-card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:1rem 1.2rem}
-.s-label{font-size:.68rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.1em;
-          text-transform:uppercase;margin-bottom:.4rem}
-.s-value{font-size:1.5rem;font-weight:800;color:var(--accent)}
-.species-table{width:100%%;border-collapse:collapse;font-size:.84rem}
-.species-table th{padding:.6rem 1.2rem;text-align:left;font-size:.7rem;font-family:var(--font-mono);
-                  letter-spacing:.08em;text-transform:uppercase;color:var(--textdim);border-bottom:1px solid var(--border)}
-.species-table td{padding:.75rem 1.2rem;border-bottom:1px solid var(--border);font-family:var(--font-mono)}
-.species-table tr:last-child td{border:none}
-.species-table tr:hover td{background:rgba(0,229,160,.03)}
-.bar-bg{height:8px;background:var(--bg3);border-radius:4px;overflow:hidden;width:160px}
-.bar-fill{height:100%%;background:linear-gradient(90deg,var(--accent),var(--accent2));
-          border-radius:4px;transition:width .6s}
-.err-box{padding:1rem 1.2rem;font-family:var(--font-mono);font-size:.82rem;color:var(--danger);
-         background:rgba(255,71,87,.06);border-top:1px solid rgba(255,71,87,.2)}
-.dl-row{display:flex;justify-content:flex-end;padding:.8rem 1.2rem;border-top:1px solid var(--border)}
+.results-card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
+.sum-cell{background:var(--white);padding:1.1rem 1.3rem}
+.sum-label{font-size:.72rem;font-weight:600;color:var(--ink3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.4rem}
+.sum-value{font-size:1.5rem;font-weight:600;color:var(--sage);letter-spacing:-.02em}
+.sum-value.plain{color:var(--ink)}
+
+table{width:100%%;border-collapse:collapse}
+th{padding:.6rem 1.25rem;text-align:left;font-size:.72rem;font-weight:600;color:var(--ink3);
+   letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--border)}
+td{padding:.7rem 1.25rem;border-bottom:1px solid var(--border);font-size:.87rem;color:var(--ink)}
+tr:last-child td{border:none}
+tr:hover td{background:var(--bg)}
+.bar-cell{width:35%%}
+.bar-bg{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;border:1px solid var(--border)}
+.bar-fill{height:100%%;background:var(--sage);border-radius:3px;transition:width .7s}
+.species-name{font-weight:500;text-transform:capitalize}
+.count-badge{display:inline-flex;padding:.15rem .6rem;background:var(--sage-l);color:var(--sage);
+             border:1px solid var(--sage-m);border-radius:20px;font-family:var(--mono);font-size:.8rem;font-weight:500}
+
+.err-banner{margin:.75rem 1.25rem;padding:.7rem 1rem;background:var(--rose-l);border:1px solid rgba(176,58,46,.2);
+            border-radius:var(--r-sm);color:var(--rose);font-size:.83rem;display:none}
+.dl-row{display:flex;justify-content:flex-end;padding:.9rem 1.25rem;border-top:1px solid var(--border)}
 </style></head><body>
+
 <nav>
-  <div class="nav-logo"><span></span>Sentinel</div>
+  <div class="nav-brand"><div class="nav-icon">🦅</div>Sentinel</div>
   <div class="nav-links">
-    <a href="/dashboard">Dashboard</a>
-    <a href="/analyse" class="active">Analyse Video</a>
-    <a href="/recordings">Recordings</a>
+    <a href="/dashboard"  class="nav-link">Dashboard</a>
+    <a href="/analyse"    class="nav-link active">Analyse</a>
+    <a href="/recordings" class="nav-link">Recordings</a>
+  </div>
+  <div class="nav-right">
+    <span class="device-pill">{{ device }}</span>
     <div class="nav-sep"></div>
-    <span class="gpu-badge">{{ device }}</span>
-    <div class="nav-sep"></div>
-    <a href="/logout">Logout</a>
+    <a href="/logout" class="nav-logout">Sign out</a>
   </div>
 </nav>
-<main>
-  <h1>Video Animal Analysis</h1>
 
-  <div class="upload-zone" id="drop-zone">
+<main>
+  <h1>Video Analysis</h1>
+  <p class="page-sub">Upload a video to count unique individuals per species — no double-counting across frames.</p>
+
+  <div class="drop-zone" id="drop-zone">
     <input type="file" id="file-input" accept="video/*">
-    <div class="upload-icon">🎬</div>
-    <div class="upload-title">Drop a video or click to browse</div>
-    <div class="upload-sub">MP4 · AVI · MOV · MKV · WEBM &nbsp;·&nbsp; No size limit · Streamed to disk</div>
-    <div class="upload-chosen" id="chosen-name"></div>
-    <div class="upload-speed" id="upload-speed"></div>
+    <div class="drop-icon">🎬</div>
+    <div class="drop-title">Drop a video file or click to browse</div>
+    <div class="drop-sub">MP4 · AVI · MOV · MKV · WEBM &nbsp;·&nbsp; No file size limit</div>
+    <div class="drop-chosen" id="chosen-name"></div>
+    <div class="drop-speed" id="upload-speed"></div>
   </div>
 
   <div class="controls-row">
     <button class="btn btn-primary" id="analyse-btn" onclick="startAnalysis()" disabled>
-      Run Analysis
+      Run analysis
     </button>
-    <span class="tag tag-blue" style="font-size:.72rem">Tracks unique individuals — no repeat counting</span>
+    <span class="badge badge-neutral">Tracks unique individuals — no repeat counting</span>
   </div>
 
-  <!-- Combined upload + analysis progress -->
   <div class="prog-wrap" id="prog-wrap">
-    <div class="prog-label">
-      <span id="prog-label-text">Uploading…</span>
-      <span id="prog-pct">0%%</span>
+    <div class="prog-header">
+      <span class="prog-label" id="prog-label-text">Uploading…</span>
+      <span class="prog-pct" id="prog-pct">0%%</span>
     </div>
-    <div class="prog-bar-bg"><div class="prog-bar" id="prog-bar"></div></div>
+    <div class="prog-bg"><div class="prog-bar" id="prog-bar"></div></div>
     <div class="prog-stage" id="prog-stage"></div>
   </div>
 
-  <!-- Results -->
   <div class="results" id="results-section">
-    <div class="panel">
-      <div class="panel-head">
-        <div style="display:flex;align-items:center">
-          <div class="title-dot"></div>Analysis Results
-        </div>
-        <span class="tag tag-green">Done</span>
+    <div class="results-card">
+      <div class="card-head">
+        <span class="card-title">Results</span>
+        <span class="badge badge-sage">Complete</span>
       </div>
       <div class="summary-grid">
-        <div class="s-card"><div class="s-label">Total Unique Animals</div><div class="s-value" id="res-total">—</div></div>
-        <div class="s-card"><div class="s-label">Species Found</div><div class="s-value" id="res-species">—</div></div>
-        <div class="s-card"><div class="s-label">Frames Analysed</div><div class="s-value" id="res-frames">—</div></div>
-        <div class="s-card"><div class="s-label">Ran On</div><div class="s-value" id="res-device" style="font-size:1rem">—</div></div>
+        <div class="sum-cell"><div class="sum-label">Unique animals</div><div class="sum-value" id="res-total">—</div></div>
+        <div class="sum-cell"><div class="sum-label">Species found</div><div class="sum-value plain" id="res-species">—</div></div>
+        <div class="sum-cell"><div class="sum-label">Frames analysed</div><div class="sum-value plain" id="res-frames">—</div></div>
+        <div class="sum-cell"><div class="sum-label">Ran on</div><div class="sum-value plain" id="res-device" style="font-size:1rem">—</div></div>
       </div>
-      <table class="species-table">
-        <thead><tr><th>#</th><th>Species</th><th>Unique Count</th><th>Distribution</th></tr></thead>
+      <table>
+        <thead><tr><th>#</th><th>Species</th><th>Unique individuals</th><th class="bar-cell">Distribution</th></tr></thead>
         <tbody id="species-tbody"></tbody>
       </table>
-      <div class="err-box" id="err-box" style="display:none"></div>
+      <div class="err-banner" id="err-box"></div>
       <div class="dl-row" id="dl-row" style="display:none">
-        <a id="dl-link" href="#" class="btn btn-ghost" download>↓ Download Annotated Video</a>
+        <a id="dl-link" href="#" class="btn btn-outline" download>↓ Download annotated video</a>
       </div>
     </div>
   </div>
 </main>
+
 <script>
-// ── Reload-resilient job tracking via localStorage ────────────────────────────
-const JOB_KEY    = 'sentinel_job_id';
-let currentJobId = localStorage.getItem(JOB_KEY) || null;
-let pollTimer    = null;
+const JOB_KEY='sentinel_job_id';
+let currentJobId=localStorage.getItem(JOB_KEY)||null;
+let pollTimer=null;
+const fileInput=document.getElementById('file-input');
+const dropZone=document.getElementById('drop-zone');
+const chosenName=document.getElementById('chosen-name');
+const analyseBtn=document.getElementById('analyse-btn');
+const speedEl=document.getElementById('upload-speed');
 
-const fileInput  = document.getElementById('file-input');
-const dropZone   = document.getElementById('drop-zone');
-const chosenName = document.getElementById('chosen-name');
-const analyseBtn = document.getElementById('analyse-btn');
-const speedEl    = document.getElementById('upload-speed');
-
-fileInput.addEventListener('change', () => {
-  if(fileInput.files[0]){ chosenName.textContent=fileInput.files[0].name; analyseBtn.disabled=false; }
+fileInput.addEventListener('change',()=>{
+  if(fileInput.files[0]){chosenName.textContent=fileInput.files[0].name;analyseBtn.disabled=false;}
 });
-dropZone.addEventListener('dragover',  e=>{ e.preventDefault(); dropZone.classList.add('drag'); });
-dropZone.addEventListener('dragleave', ()=>dropZone.classList.remove('drag'));
-dropZone.addEventListener('drop', e=>{
-  e.preventDefault(); dropZone.classList.remove('drag');
+dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag');});
+dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('drag'));
+dropZone.addEventListener('drop',e=>{
+  e.preventDefault();dropZone.classList.remove('drag');
   if(e.dataTransfer.files[0]){
-    // assign to input
-    const dt = new DataTransfer();
-    dt.items.add(e.dataTransfer.files[0]);
-    fileInput.files = dt.files;
-    chosenName.textContent = e.dataTransfer.files[0].name;
-    analyseBtn.disabled = false;
+    const dt=new DataTransfer();dt.items.add(e.dataTransfer.files[0]);
+    fileInput.files=dt.files;chosenName.textContent=e.dataTransfer.files[0].name;analyseBtn.disabled=false;
   }
 });
 
 async function startAnalysis(){
-  if(!fileInput.files[0]) return;
-  analyseBtn.disabled = true;
+  if(!fileInput.files[0])return;
+  analyseBtn.disabled=true;
   document.getElementById('results-section').classList.remove('show');
   document.getElementById('prog-wrap').classList.add('show');
-  setProgress(0, 'Uploading…', '');
-
-  const file   = fileInput.files[0];
-  const sizeMB = (file.size / 1024 / 1024).toFixed(1);
-
-  // ── Chunked XHR upload with progress ──────────────────────────────────────
-  try {
-    const jobId = await uploadWithProgress(file);
-    currentJobId = jobId;
-    localStorage.setItem(JOB_KEY, jobId);   // survive reload
-    setProgress(100, 'Analysing…', 'Upload complete — running YOLO inference');
-    document.getElementById('prog-label-text').textContent = 'Analysing…';
-    document.getElementById('prog-bar').style.background = 'var(--accent2)';
-    pollTimer = setInterval(pollJob, 1500);
-  } catch(e) {
-    showError('Upload failed: ' + e.message);
-    analyseBtn.disabled = false;
-  }
+  setProgress(0,'Uploading…','');
+  try{
+    const jobId=await uploadWithProgress(fileInput.files[0]);
+    currentJobId=jobId;localStorage.setItem(JOB_KEY,jobId);
+    document.getElementById('prog-bar').style.background='var(--blue)';
+    setProgress(100,'Analysing…','Upload complete — running inference');
+    pollTimer=setInterval(pollJob,1500);
+  }catch(e){showError('Upload failed: '+e.message);analyseBtn.disabled=false;}
 }
 
-function uploadWithProgress(file) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    let lastLoaded = 0, lastTime = Date.now();
-
-    xhr.upload.addEventListener('progress', e => {
-      if(!e.lengthComputable) return;
-      const pct = Math.round(e.loaded / e.total * 100);
-      const now = Date.now();
-      const dt  = (now - lastTime) / 1000;
-      const bps = (e.loaded - lastLoaded) / dt;
-      lastLoaded = e.loaded; lastTime = now;
-      const speed = bps > 1e6
-        ? (bps/1e6).toFixed(1) + ' MB/s'
-        : (bps/1e3).toFixed(0) + ' KB/s';
-      speedEl.textContent = speed;
-      const eta = bps > 0 ? Math.round((e.total - e.loaded) / bps) : '?';
-      setProgress(pct, 'Uploading…', `${(e.loaded/1e6).toFixed(0)} / ${(e.total/1e6).toFixed(0)} MB  ·  ${speed}  ·  ETA ${eta}s`);
+function uploadWithProgress(file){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    let lastLoaded=0,lastTime=Date.now();
+    xhr.upload.addEventListener('progress',e=>{
+      if(!e.lengthComputable)return;
+      const pct=Math.round(e.loaded/e.total*100);
+      const now=Date.now(),dt=(now-lastTime)/1000;
+      const bps=(e.loaded-lastLoaded)/dt;
+      lastLoaded=e.loaded;lastTime=now;
+      const speed=bps>1e6?(bps/1e6).toFixed(1)+' MB/s':(bps/1e3).toFixed(0)+' KB/s';
+      speedEl.textContent=speed;
+      const eta=bps>0?Math.round((e.total-e.loaded)/bps)+'s':'…';
+      setProgress(pct,'Uploading…',`${(e.loaded/1e6).toFixed(0)} / ${(e.total/1e6).toFixed(0)} MB  ·  ${speed}  ·  ETA ${eta}`);
     });
-
-    xhr.addEventListener('load', () => {
-      speedEl.textContent = '';
-      if(xhr.status === 202) {
-        try { resolve(JSON.parse(xhr.responseText).job_id); }
-        catch(e) { reject(new Error('Bad server response')); }
-      } else {
-        let msg = 'Server error ' + xhr.status;
-        try { msg = JSON.parse(xhr.responseText).error || msg; } catch(_){}
-        reject(new Error(msg));
-      }
+    xhr.addEventListener('load',()=>{
+      speedEl.textContent='';
+      if(xhr.status===202){try{resolve(JSON.parse(xhr.responseText).job_id);}catch(e){reject(new Error('Bad response'));}}
+      else{let msg='Server error '+xhr.status;try{msg=JSON.parse(xhr.responseText).error||msg;}catch(_){}reject(new Error(msg));}
     });
-    xhr.addEventListener('error',   () => reject(new Error('Network error')));
-    xhr.addEventListener('timeout', () => reject(new Error('Upload timed out')));
-    xhr.timeout = {{ timeout_ms }};
-
-    const fd = new FormData();
-    fd.append('video', file);
-    xhr.open('POST', '/api/analyse');
-    xhr.send(fd);
+    xhr.addEventListener('error',()=>reject(new Error('Network error')));
+    xhr.addEventListener('timeout',()=>reject(new Error('Timed out')));
+    xhr.timeout={{ timeout_ms }};
+    const fd=new FormData();fd.append('video',file);
+    xhr.open('POST','/api/analyse');xhr.send(fd);
   });
 }
 
 async function pollJob(){
-  if(!currentJobId) return;
+  if(!currentJobId)return;
   try{
-    const r = await fetch('/api/analyse/' + currentJobId);
-    if(r.status === 404){
-      clearInterval(pollTimer);
-      localStorage.removeItem(JOB_KEY);
-      currentJobId = null;
-      showError('Job not found — server may have restarted. Please re-upload.');
-      analyseBtn.disabled = false;
-      return;
-    }
-    const data = await r.json();
-    const pct  = data.progress || 0;
-    const stage =
-      data.status==='processing' ? `Frame ${Math.round(pct)}%% — inference running` :
-      data.status==='done'       ? 'Complete!' :
-      data.status==='error'      ? 'Error' : 'Queued…';
-    setProgress(pct, 'Analysing…', stage);
-    if(data.status==='done'){
-      clearInterval(pollTimer);
-      localStorage.removeItem(JOB_KEY);
-      showResults(data);
-      analyseBtn.disabled=false;
-    } else if(data.status==='error'){
-      clearInterval(pollTimer);
-      localStorage.removeItem(JOB_KEY);
-      showError(data.error||'Unknown error');
-      analyseBtn.disabled=false;
-    }
+    const r=await fetch('/api/analyse/'+currentJobId);
+    if(r.status===404){clearInterval(pollTimer);localStorage.removeItem(JOB_KEY);currentJobId=null;
+      showError('Job not found — server may have restarted. Please re-upload.');analyseBtn.disabled=false;return;}
+    const data=await r.json();
+    const pct=data.progress||0;
+    const stage=data.status==='processing'?`Frame ${Math.round(pct)}%% — inference running`:
+                data.status==='done'?'Complete':data.status==='error'?'Error':'Queued…';
+    setProgress(pct,'Analysing…',stage);
+    if(data.status==='done'){clearInterval(pollTimer);localStorage.removeItem(JOB_KEY);showResults(data);analyseBtn.disabled=false;}
+    else if(data.status==='error'){clearInterval(pollTimer);localStorage.removeItem(JOB_KEY);showError(data.error||'Unknown error');analyseBtn.disabled=false;}
   }catch(_){}
 }
 
-function setProgress(pct, label, stage){
-  document.getElementById('prog-bar').style.width      = pct+'%%';
-  document.getElementById('prog-pct').textContent       = pct+'%%';
-  document.getElementById('prog-label-text').textContent= label;
-  document.getElementById('prog-stage').textContent     = stage;
+function setProgress(pct,label,stage){
+  document.getElementById('prog-bar').style.width=pct+'%%';
+  document.getElementById('prog-pct').textContent=pct+'%%';
+  document.getElementById('prog-label-text').textContent=label;
+  document.getElementById('prog-stage').textContent=stage;
 }
 
 function showResults(data){
   document.getElementById('results-section').classList.add('show');
   document.getElementById('err-box').style.display='none';
-  document.getElementById('res-total').textContent   = data.total_unique;
-  document.getElementById('res-species').textContent = data.species.length;
-  document.getElementById('res-frames').textContent  = data.frames_analysed;
-  document.getElementById('res-device').textContent  = data.device || '—';
-  const max = data.species[0]?.count || 1;
-  document.getElementById('species-tbody').innerHTML = data.species.map((s,i)=>`
+  document.getElementById('res-total').textContent=data.total_unique;
+  document.getElementById('res-species').textContent=data.species.length;
+  document.getElementById('res-frames').textContent=data.frames_analysed.toLocaleString();
+  document.getElementById('res-device').textContent=data.device||'—';
+  const max=data.species[0]?.count||1;
+  document.getElementById('species-tbody').innerHTML=data.species.map((s,i)=>`
     <tr>
-      <td style="color:var(--textdim)">${i+1}</td>
-      <td style="font-weight:600;text-transform:capitalize">${s.species}</td>
-      <td><span class="tag tag-green">${s.count}</span></td>
-      <td><div class="bar-bg"><div class="bar-fill" style="width:${Math.round(s.count/max*100)}%%"></div></div></td>
+      <td style="color:var(--ink3);font-family:var(--mono)">${i+1}</td>
+      <td><span class="species-name">${s.species}</span></td>
+      <td><span class="count-badge">${s.count}</span></td>
+      <td class="bar-cell"><div class="bar-bg"><div class="bar-fill" style="width:${Math.round(s.count/max*100)}%%"></div></div></td>
     </tr>`).join('');
-  if(data.frames_analysed > 0){
+  if(data.frames_analysed>0){
     document.getElementById('dl-link').href='/api/analyse/'+currentJobId+'/download';
     document.getElementById('dl-row').style.display='flex';
   }
@@ -1462,34 +1609,20 @@ function showResults(data){
 
 function showError(msg){
   document.getElementById('results-section').classList.add('show');
-  document.getElementById('err-box').style.display='block';
-  document.getElementById('err-box').textContent='✗ '+msg;
+  const box=document.getElementById('err-box');box.style.display='block';box.textContent='⚠ '+msg;
   document.getElementById('species-tbody').innerHTML='';
   document.getElementById('dl-row').style.display='none';
 }
 
-// ── Auto-resume in-progress job on page load / reload ─────────────────────────
 (async()=>{
-  if(!currentJobId) return;
+  if(!currentJobId)return;
   try{
-    const r = await fetch('/api/analyse/' + currentJobId);
-    if(r.status === 404){ localStorage.removeItem(JOB_KEY); currentJobId=null; return; }
-    const data = await r.json();
-    if(data.status === 'done'){
-      document.getElementById('prog-wrap').classList.add('show');
-      localStorage.removeItem(JOB_KEY);
-      showResults(data);
-    } else if(data.status === 'error'){
-      localStorage.removeItem(JOB_KEY);
-      document.getElementById('prog-wrap').classList.add('show');
-      showError(data.error||'Unknown error');
-    } else {
-      // still running — show progress and resume polling
-      document.getElementById('prog-wrap').classList.add('show');
-      setProgress(data.progress||0, 'Analysing…', 'Resumed after reload…');
-      document.getElementById('prog-bar').style.background = 'var(--accent2)';
-      pollTimer = setInterval(pollJob, 1500);
-    }
+    const r=await fetch('/api/analyse/'+currentJobId);
+    if(r.status===404){localStorage.removeItem(JOB_KEY);currentJobId=null;return;}
+    const data=await r.json();
+    if(data.status==='done'){document.getElementById('prog-wrap').classList.add('show');localStorage.removeItem(JOB_KEY);showResults(data);}
+    else if(data.status==='error'){localStorage.removeItem(JOB_KEY);document.getElementById('prog-wrap').classList.add('show');showError(data.error||'Unknown error');}
+    else{document.getElementById('prog-wrap').classList.add('show');setProgress(data.progress||0,'Analysing…','Resumed…');document.getElementById('prog-bar').style.background='var(--blue)';pollTimer=setInterval(pollJob,1500);}
   }catch(_){}
 })();
 </script>
@@ -1497,68 +1630,70 @@ function showError(msg){
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RECORDINGS PAGE
+# RECORDINGS
 # ─────────────────────────────────────────────────────────────────────────────
 RECORDINGS_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sentinel — Recordings</title>
-<style>""" + _BASE_CSS + """
-body{display:grid;grid-template-rows:56px 1fr;min-height:100vh}
-nav{display:flex;align-items:center;justify-content:space-between;padding:0 1.8rem;
-    border-bottom:1px solid var(--border);background:var(--bg2)}
-.nav-logo{font-weight:800;font-size:1rem;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
-.nav-links a{font-size:.8rem;font-family:var(--font-mono);color:var(--textdim);letter-spacing:.05em;margin-left:1rem;transition:color .2s}
-.nav-links a:hover,.nav-links a.active{color:var(--accent)}
-main{padding:1.8rem}
-h1{font-size:1.05rem;font-weight:800;letter-spacing:.06em;margin-bottom:1.4rem;text-transform:uppercase}
-.panel{background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
-.panel-head{display:flex;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;
-            border-bottom:1px solid var(--border);font-size:.75rem;font-family:var(--font-mono);
-            letter-spacing:.07em;text-transform:uppercase;color:var(--textdim)}
-table{width:100%%;border-collapse:collapse;font-size:.82rem}
-th{padding:.6rem 1.2rem;text-align:left;font-size:.7rem;font-family:var(--font-mono);letter-spacing:.08em;
-   text-transform:uppercase;color:var(--textdim);border-bottom:1px solid var(--border)}
-td{padding:.7rem 1.2rem;border-bottom:1px solid var(--border);font-family:var(--font-mono)}
+<style>""" + _BASE_CSS + _NAV_CSS + """
+body{display:grid;grid-template-rows:56px 1fr;min-height:100vh;background:var(--bg)}
+main{padding:1.75rem 2rem;overflow-y:auto}
+h1{font-size:1.3rem;font-weight:600;color:var(--ink);letter-spacing:-.02em;margin-bottom:.3rem}
+.page-sub{font-size:.87rem;color:var(--ink3);margin-bottom:2rem}
+.rec-card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
+table{width:100%%;border-collapse:collapse}
+th{padding:.65rem 1.25rem;text-align:left;font-size:.72rem;font-weight:600;color:var(--ink3);
+   letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--bg)}
+td{padding:.75rem 1.25rem;border-bottom:1px solid var(--border);font-size:.87rem;color:var(--ink)}
 tr:last-child td{border:none}
-tr:hover td{background:rgba(0,229,160,.03)}
-.empty{padding:2rem;text-align:center;color:var(--textdim);font-family:var(--font-mono)}
+tr:hover td{background:var(--bg)}
+.fname{font-family:var(--mono);font-size:.81rem;color:var(--ink2)}
+.fsize{font-family:var(--mono);font-size:.81rem;color:var(--ink3)}
+.empty{padding:3rem;text-align:center;color:var(--ink3);font-size:.87rem}
 </style></head><body>
+
 <nav>
-  <div class="nav-logo">⬡ Sentinel</div>
+  <div class="nav-brand"><div class="nav-icon">🦅</div>Sentinel</div>
   <div class="nav-links">
-    <a href="/dashboard">Dashboard</a>
-    <a href="/analyse">Analyse Video</a>
-    <a href="/recordings" class="active">Recordings</a>
-    <a href="/logout">Logout</a>
+    <a href="/dashboard"  class="nav-link">Dashboard</a>
+    <a href="/analyse"    class="nav-link">Analyse</a>
+    <a href="/recordings" class="nav-link active">Recordings</a>
+  </div>
+  <div class="nav-right">
+    <a href="/logout" class="nav-logout">Sign out</a>
   </div>
 </nav>
+
 <main>
-  <h1>Saved Recordings</h1>
-  <div class="panel">
-    <div class="panel-head">
-      <span>{{ videos|length }} file{{ 's' if videos|length != 1 }}</span>
-      <span class="tag tag-blue">{{ dir }}</span>
-    </div>
+  <h1>Recordings</h1>
+  <p class="page-sub">Auto-saved clips from the live stream — recorded when animals are detected.</p>
+  <div class="rec-card">
     {% if videos %}
     <table>
-      <tr><th>#</th><th>Filename</th><th>Size</th><th>Action</th></tr>
-      {% for v in videos %}
-      <tr>
-        <td style="color:var(--textdim)">{{ loop.index }}</td>
-        <td>{{ v.name }}</td>
-        <td>{{ v.size }}</td>
-        <td><a class="btn btn-ghost" style="padding:.3rem .8rem;font-size:.72rem"
-               href="/download/{{ v.name }}">Download</a></td>
-      </tr>
-      {% endfor %}
+      <thead><tr><th>#</th><th>Filename</th><th>Size</th><th></th></tr></thead>
+      <tbody>
+        {% for v in videos %}
+        <tr>
+          <td style="color:var(--ink3);font-family:var(--mono);width:3rem">{{ loop.index }}</td>
+          <td><span class="fname">{{ v.name }}</span></td>
+          <td><span class="fsize">{{ v.size }}</span></td>
+          <td style="text-align:right">
+            <a href="/download/{{ v.name }}" class="btn btn-outline" style="padding:.3rem .8rem;font-size:.78rem">
+              ↓ Download
+            </a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
     </table>
     {% else %}
-    <div class="empty">No recordings yet.</div>
+    <div class="empty">No recordings yet. Clips are saved automatically when animals are detected on the live feed.</div>
     {% endif %}
   </div>
 </main>
 </body></html>
 """
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
