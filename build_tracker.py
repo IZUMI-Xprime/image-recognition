@@ -3,7 +3,7 @@ build_tracker.py
 ================
 Builds tracker_cy.pyx → tracker_cy.pyd  WITHOUT distutils, setuptools, or MSVC.
 Works on Windows with MinGW-w64 (gcc) and on Linux/macOS with gcc/clang.
-
+ 
 Usage
 -----
   python build_tracker.py
