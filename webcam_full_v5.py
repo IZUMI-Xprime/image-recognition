@@ -1,7 +1,7 @@
 """
 Wildlife Sentinel v5
 ====================
-New in v5:
+New in v5: 
   • Analysis job survives page reload — job_id stored in localStorage, auto-resumes on return
   • Live cam Start / Stop / Snapshot controls
   • YOLOv8 ByteTrack integration — persistent track IDs kill duplicate counts across frames
