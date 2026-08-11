@@ -1,5 +1,5 @@
 # 🦅 Wildlife Sentinel
-
+ 
 > Real-time wildlife detection, unique individual counting, and video analysis — powered by YOLOv8 segmentation, ByteTrack, Cython, and GPU acceleration. Runs entirely locally with a custom browser dashboard.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square)
