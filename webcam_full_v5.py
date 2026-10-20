@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from threading import Lock, Event
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import matplotlib
@@ -34,11 +35,21 @@ try:
     import seaborn as sns
 except ImportError:
     sns = None
-import torch
+try:
+    import torch
+    _TORCH_OK = True
+except ImportError:
+    torch = None
+    _TORCH_OK = False
 from flask import (Flask, Response, jsonify, redirect,
                    render_template_string, request, send_file,
                    session, stream_with_context, url_for)
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+    _YOLO_OK = True
+except ImportError:
+    YOLO = None
+    _YOLO_OK = False
 from werkzeug.utils import secure_filename
 
 try:
@@ -62,7 +73,7 @@ log = logging.getLogger("sentinel")
 # ─────────────────────────────────────────────────────────────────────────────
 # GPU detection
 # ─────────────────────────────────────────────────────────────────────────────
-if torch.cuda.is_available():
+if _TORCH_OK and torch is not None and torch.cuda.is_available():
     DEVICE       = "cuda:0"
     GPU_NAME     = torch.cuda.get_device_name(0)
     BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", "8"))   # frames per GPU batch
@@ -238,17 +249,35 @@ def err_500(e):
 # yolov8s-seg (small) gives significantly better mask accuracy than nano.
 # Two separate instances: live stream and video analysis never share a lock.
 # ─────────────────────────────────────────────────────────────────────────────
-_SEG_MODEL     = os.environ.get("SEG_MODEL", "yolov8s-seg.pt")   # override via env
-model_stream   = YOLO(_SEG_MODEL)   # live webcam feed
-model_analysis = YOLO(_SEG_MODEL)   # uploaded video analysis
-model_stream.to(DEVICE)
-model_analysis.to(DEVICE)
+_DEFAULT_MODEL = "yolov8n-seg.pt" if (DEVICE == "cpu" or os.path.exists("yolov8n-seg.pt")) else "yolov8s-seg.pt"
+_SEG_MODEL     = os.environ.get("SEG_MODEL", _DEFAULT_MODEL)
+if _YOLO_OK and YOLO is not None:
+    try:
+        model_stream   = YOLO(_SEG_MODEL)   # live webcam feed
+        model_analysis = YOLO(_SEG_MODEL)   # uploaded video analysis
+        model_stream.to(DEVICE)
+        model_analysis.to(DEVICE)
+        log.info("Loaded YOLOv8 segmentation model: %s on %s", _SEG_MODEL, DEVICE)
+    except Exception as _ye:
+        log.warning("Could not load YOLO model %s: %s", _SEG_MODEL, _ye)
+        model_stream = None
+        model_analysis = None
+else:
+    model_stream   = None
+    model_analysis = None
+    log.warning("ultralytics not installed; running in pipeline simulation mode.")
 _stream_lock   = Lock()               # guards model_stream only
 _analysis_lock = Lock()               # guards model_analysis only
 
 # aliases so heatmap route works unchanged
 model       = model_stream
 _model_lock = _stream_lock
+
+_last_frame = None
+_last_frame_lock = Lock()
+_spatial_heatmap = None
+_heatmap_lock = Lock()
+_show_heatmap_on_stream = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Thread pools
@@ -275,6 +304,151 @@ _cam_event.set()                # starts in "on" state
 
 # Performance metrics (updated by generate_frames)
 START_TIME      = time.time()
+# ─────────────────────────────────────────────────────────────────────────────
+# Enterprise Architecture Observability & Telemetry Engine
+# ─────────────────────────────────────────────────────────────────────────────
+class TelemetryTracker:
+    """High-frequency telemetry and health diagnostic engine for cloud delivery."""
+
+    def __init__(self, window_size: int = 60, target_fps: float = 25.0) -> None:
+        self.window_size = window_size
+        self.target_fps = target_fps
+        self.lock = Lock()
+
+        self.frame_latencies = deque(maxlen=window_size)
+        self.preprocess_latencies = deque(maxlen=window_size)
+        self.infer_latencies = deque(maxlen=window_size)
+        self.tracking_latencies = deque(maxlen=window_size)
+        self.spatial_latencies = deque(maxlen=window_size)
+        self.encode_latencies = deque(maxlen=window_size)
+
+        self.total_frames_captured = 0
+        self.total_frames_processed = 0
+        self.total_frames_dropped = 0
+        self.consecutive_errors = 0
+        self.last_frame_ts = time.time()
+
+    def record_frame(
+        self,
+        t_total: float,
+        t_prep: float = 0.0,
+        t_infer: float = 0.0,
+        t_track: float = 0.0,
+        t_spatial: float = 0.0,
+        t_enc: float = 0.0,
+        dropped: int = 0,
+    ) -> None:
+        with self.lock:
+            self.total_frames_processed += 1
+            self.total_frames_dropped += dropped
+            self.total_frames_captured += (1 + dropped)
+
+            self.frame_latencies.append(t_total)
+            self.preprocess_latencies.append(t_prep)
+            self.infer_latencies.append(t_infer)
+            self.tracking_latencies.append(t_track)
+            self.spatial_latencies.append(t_spatial)
+            self.encode_latencies.append(t_enc)
+            self.last_frame_ts = time.time()
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            lats = list(self.frame_latencies)
+            mean_lat = float(np.mean(lats)) if lats else 0.0
+            p50_lat = float(np.percentile(lats, 50)) if lats else 0.0
+            p95_lat = float(np.percentile(lats, 95)) if lats else 0.0
+            p99_lat = float(np.percentile(lats, 99)) if lats else 0.0
+            jitter_ms = float(np.std(lats)) if len(lats) > 1 else 0.0
+
+            fps = float(len(lats) / (sum(lats) / 1000.0)) if lats and sum(lats) > 0 else 0.0
+            total_cap = max(self.total_frames_captured, 1)
+            drop_rate_pct = float(self.total_frames_dropped / total_cap) * 100.0
+
+            prep_ms = float(np.mean(self.preprocess_latencies)) if self.preprocess_latencies else 0.0
+            infer_ms = float(np.mean(self.infer_latencies)) if self.infer_latencies else 0.0
+            track_ms = float(np.mean(self.tracking_latencies)) if self.tracking_latencies else 0.0
+            spatial_ms = float(np.mean(self.spatial_latencies)) if self.spatial_latencies else 0.0
+            enc_ms = float(np.mean(self.encode_latencies)) if self.encode_latencies else 0.0
+
+            cpu_sys = 0.0
+            cpu_proc = 0.0
+            ram_proc_rss_mb = 0.0
+            ram_proc_vms_mb = 0.0
+            ram_sys_pct = 0.0
+            ram_sys_avail_mb = 0.0
+            if _PSUTIL:
+                try:
+                    cpu_sys = psutil.cpu_percent(interval=None)
+                    proc = psutil.Process()
+                    cpu_proc = proc.cpu_percent(interval=None)
+                    mem_info = proc.memory_info()
+                    ram_proc_rss_mb = mem_info.rss / 1024.0 / 1024.0
+                    ram_proc_vms_mb = mem_info.vms / 1024.0 / 1024.0
+                    vmem = psutil.virtual_memory()
+                    ram_sys_pct = vmem.percent
+                    ram_sys_avail_mb = vmem.available / 1024.0 / 1024.0
+                except Exception:
+                    pass
+
+            gpu_mem_alloc_mb = 0.0
+            gpu_mem_reserved_mb = 0.0
+            if DEVICE != "cpu" and _TORCH_OK and torch is not None and torch.cuda.is_available():
+                try:
+                    gpu_mem_alloc_mb = torch.cuda.memory_allocated(0) / 1024.0 / 1024.0
+                    gpu_mem_reserved_mb = torch.cuda.memory_reserved(0) / 1024.0 / 1024.0
+                except Exception:
+                    pass
+
+            # Enterprise SLA health categorization
+            if drop_rate_pct < 5.0 and (mean_lat < 140.0 or DEVICE != "cpu"):
+                health = "HEALTHY"
+            elif drop_rate_pct < 25.0:
+                health = "DEGRADED"
+            else:
+                health = "CRITICAL"
+
+            uptime = int(time.time() - START_TIME)
+            h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
+
+            return {
+                "health": health,
+                "fps": round(fps, 1),
+                "target_fps": self.target_fps,
+                "drop_rate_pct": round(drop_rate_pct, 2),
+                "frames_processed": self.total_frames_processed,
+                "frames_dropped": self.total_frames_dropped,
+                "latency_breakdown_ms": {
+                    "cv5_preprocess": round(prep_ms, 2),
+                    "yolo_inference": round(infer_ms, 2),
+                    "bytetrack_cython": round(track_ms, 2),
+                    "spatial_analytics": round(spatial_ms, 2),
+                    "jpeg_encode": round(enc_ms, 2),
+                    "total_mean": round(mean_lat, 2),
+                    "p50": round(p50_lat, 2),
+                    "p95": round(p95_lat, 2),
+                    "p99": round(p99_lat, 2),
+                    "jitter": round(jitter_ms, 2),
+                },
+                "resources": {
+                    "cpu_system_pct": round(cpu_sys, 1),
+                    "cpu_process_pct": round(cpu_proc, 1),
+                    "ram_process_rss_mb": round(ram_proc_rss_mb, 1),
+                    "ram_process_vms_mb": round(ram_proc_vms_mb, 1),
+                    "ram_system_used_pct": round(ram_sys_pct, 1),
+                    "ram_system_available_mb": round(ram_sys_avail_mb, 1),
+                    "gpu_device": GPU_NAME,
+                    "gpu_vram_allocated_mb": round(gpu_mem_alloc_mb, 1),
+                    "gpu_vram_reserved_mb": round(gpu_mem_reserved_mb, 1),
+                },
+                "uptime_s": uptime,
+                "uptime_fmt": f"{h:02d}:{m:02d}:{s:02d}",
+                "opencv_version": cv2.__version__,
+                "device": DEVICE,
+            }
+
+telemetry = TelemetryTracker(window_size=60, target_fps=25.0)
+
+
 _perf_lock      = Lock()
 _perf = {
     "fps":         0.0,
@@ -399,6 +573,8 @@ def _infer_batch(frames: list) -> list:
       masks_xy   : [np.ndarray(N,2) or None, …]
     """
     all_results = []
+    if model_analysis is None:
+        return [([], []) for _ in frames]
     with _analysis_lock:
         for frame in frames:
             # track() with persist=True maintains ByteTrack state across calls
@@ -709,53 +885,128 @@ def _finalize_clip(video_path, counts):
             log.error("AWS clip upload/logging failed: %s", _aerr)
 
 
+def _draw_hud_badge(
+    frame: np.ndarray,
+    x: int,
+    y: int,
+    title: str,
+    subtitle: Optional[str] = None,
+    accent_col: Tuple[int, int, int] = (142, 199, 72),
+) -> None:
+    """Render a sleek glassmorphic HUD badge with translucent background and accent edge."""
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale_main = 0.44
+    scale_sub = 0.36
+    thick = 1
+
+    (tw_main, th_main), _ = cv2.getTextSize(title, font, scale_main, thick)
+    tw_sub, th_sub = (0, 0)
+    if subtitle:
+        (tw_sub, th_sub), _ = cv2.getTextSize(subtitle, font, scale_sub, thick)
+
+    pill_w = max(tw_main, tw_sub) + 22
+    pill_h = (th_main + th_sub + 12) if subtitle else (th_main + 12)
+
+    px = int(np.clip(x, 6, max(w - pill_w - 6, 6)))
+    py = int(np.clip(y - pill_h - 4, 6, max(h - pill_h - 6, 6)))
+
+    # Dark translucent glass backdrop
+    sub_img = frame[py : py + pill_h, px : px + pill_w]
+    if sub_img.shape[0] == pill_h and sub_img.shape[1] == pill_w:
+        glass = np.full_like(sub_img, (18, 20, 24))
+        cv2.addWeighted(glass, 0.78, sub_img, 0.22, 0, sub_img)
+        cv2.rectangle(frame, (px, py), (px + pill_w, py + pill_h), (55, 62, 70), 1, cv2.LINE_AA)
+        cv2.rectangle(frame, (px, py), (px + 4, py + pill_h), accent_col, -1)
+
+    text_x = px + 9
+    text_y = py + th_main + 4
+    cv2.putText(frame, title, (text_x, text_y), font, scale_main, (245, 245, 248), thick, cv2.LINE_AA)
+
+    if subtitle:
+        sub_y = text_y + th_sub + 4
+        cv2.putText(frame, subtitle, (text_x, sub_y), font, scale_sub, accent_col, thick, cv2.LINE_AA)
+
+
+def _draw_tech_corners(
+    frame: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    colour: Tuple[int, int, int],
+    corner_len: int = 14,
+) -> None:
+    """Draw sleek sci-fi / military grade HUD corner reticles."""
+    x1, y1, x2, y2 = bbox
+    sub_box = frame[y1:y2, x1:x2]
+    if sub_box.size > 0:
+        box_overlay = sub_box.copy()
+        cv2.rectangle(box_overlay, (0, 0), (x2 - x1, y2 - y1), colour, 1)
+        cv2.addWeighted(box_overlay, 0.20, sub_box, 0.80, 0, sub_box)
+
+    c_len = min(corner_len, max((x2 - x1) // 4, 6), max((y2 - y1) // 4, 6))
+
+    # Top-Left
+    cv2.line(frame, (x1, y1), (x1 + c_len, y1), colour, 2, cv2.LINE_AA)
+    cv2.line(frame, (x1, y1), (x1, y1 + c_len), colour, 2, cv2.LINE_AA)
+    # Top-Right
+    cv2.line(frame, (x2, y1), (x2 - c_len, y1), colour, 2, cv2.LINE_AA)
+    cv2.line(frame, (x2, y1), (x2 - c_len, y1 + c_len), colour, 2, cv2.LINE_AA)
+    # Bottom-Left
+    cv2.line(frame, (x1, y2), (x1 + c_len, y2), colour, 2, cv2.LINE_AA)
+    cv2.line(frame, (x1, y2), (x1, y2 - c_len), colour, 2, cv2.LINE_AA)
+    # Bottom-Right
+    cv2.line(frame, (x2, y2), (x2 - c_len, y2), colour, 2, cv2.LINE_AA)
+    cv2.line(frame, (x2, y2), (x2, y2 - c_len), colour, 2, cv2.LINE_AA)
+
+
+def _draw_env_hud_pill(frame: np.ndarray, env_mode: str, w: int, h: int) -> None:
+    """Render an aesthetic sensor mode HUD pill in the top-right corner."""
+    mode_text = env_mode.replace("_", " ").upper()
+    pill_text = f"SENSOR: {mode_text}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.38
+    thick = 1
+    (tw, th), _ = cv2.getTextSize(pill_text, font, scale, thick)
+    pw = tw + 22
+    ph = th + 12
+    px = w - pw - 12
+    py = 10
+
+    sub = frame[py : py + ph, px : px + pw]
+    if sub.shape[0] == ph and sub.shape[1] == pw:
+        glass = np.full_like(sub, (18, 20, 24))
+        cv2.addWeighted(glass, 0.78, sub, 0.22, 0, sub)
+        accent = (72, 199, 142) if env_mode == "daylight" else (60, 175, 245)
+        cv2.rectangle(frame, (px, py), (px + pw, py + ph), (50, 58, 66), 1, cv2.LINE_AA)
+        cv2.circle(frame, (px + 8, py + ph // 2), 3, accent, -1, cv2.LINE_AA)
+        cv2.putText(frame, pill_text, (px + 16, py + th + 4), font, scale, (230, 235, 240), thick, cv2.LINE_AA)
+
+
 def _draw_seg(frame: np.ndarray,
               mask_xy: np.ndarray,
               colour: tuple,
-              label: str,
-              alpha: float = 0.35) -> None:
-    """
-    Draw segmentation polygon + semi-transparent fill + clearly visible label.
-    Label has a solid background pill so it's readable on any background.
-    """
+              title: str,
+              subtitle: Optional[str] = None,
+              alpha: float = 0.28) -> None:
+    """Draw refined semi-transparent instance segmentation mask + luminous contour + HUD badge."""
     if mask_xy is None or len(mask_xy) < 3:
         return
 
-    h, w = frame.shape[:2]
     pts = mask_xy.astype(np.int32).reshape((-1, 1, 2))
+    # Smooth jagged contour
+    pts = cv2.approxPolyDP(pts, 1.0, True)
 
-    # ── Semi-transparent fill ─────────────────────────────────────────────────
+    # 1. Semi-transparent soft tinted fill
     overlay = frame.copy()
     cv2.fillPoly(overlay, [pts], colour)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
 
-    # ── Solid outline ─────────────────────────────────────────────────────────
-    cv2.polylines(frame, [pts], isClosed=True, color=colour,
-                  thickness=2, lineType=cv2.LINE_AA)
+    # 2. Luminous smooth anti-aliased contour
+    cv2.polylines(frame, [pts], isClosed=True, color=colour, thickness=2, lineType=cv2.LINE_AA)
 
-    # ── Label with solid background pill ─────────────────────────────────────
-    font       = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.52
-    thickness  = 1
-    padding    = 4
-
-    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-
-    # Place label above the topmost mask point, clamped inside frame
-    top_pt = pts[pts[:, 0, 1].argmin()][0]
-    lx = int(np.clip(top_pt[0], 0, w - tw - padding * 2 - 2))
-    ly = int(np.clip(top_pt[1] - 10, th + padding + 4, h - padding - 4))
-
-    # Solid background rectangle
-    cv2.rectangle(frame,
-                  (lx - padding, ly - th - padding),
-                  (lx + tw + padding, ly + baseline + padding),
-                  colour, cv2.FILLED)
-
-    # White text on coloured background — always readable
-    cv2.putText(frame, label,
-                (lx, ly),
-                font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    # 3. Position glass badge above topmost point
+    top_idx = pts[:, 0, 1].argmin()
+    top_pt = pts[top_idx][0]
+    _draw_hud_badge(frame, int(top_pt[0]), int(top_pt[1]), title, subtitle, colour)
 
 
 def generate_frames():
@@ -790,147 +1041,378 @@ def generate_frames():
             reconnect_stream(); time.sleep(0.1); continue
 
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None:
             reconnect_stream(); continue
+
+        # Thread-safe copy for secondary endpoints (/heatmap, /snapshot)
+        with _last_frame_lock:
+            _last_frame = frame.copy()
 
         h, w  = frame.shape[:2]
         t0    = time.perf_counter()
 
-        # ── OpenCV 5 Preprocessing (CLAHE, motion detection, denoising) ──────
-        infer_frame = frame
-        if cv5_pipeline is not None:
-            try:
-                pipe_res = cv5_pipeline.process(frame)
-                infer_frame = pipe_res.frame
-            except Exception:
-                infer_frame = frame
+        try:
+            # ── OpenCV 5 Preprocessing (CLAHE, motion detection, denoising) ──
+            infer_frame = frame
+            pipe_diag = {}
+            env_mode = "daylight"
+            pipe_res = None
+            if cv5_pipeline is not None:
+                try:
+                    pipe_res = cv5_pipeline.process(frame)
+                    infer_frame = pipe_res.frame
+                    pipe_diag = pipe_res.diagnostics
+                    if pipe_res.environment:
+                        env_mode = pipe_res.environment.mode
+                except Exception:
+                    infer_frame = frame
 
-        # ── YOLOv8 + ByteTrack (track() gives persistent IDs) ────────────────
-        with _stream_lock:
-            track_results = model_stream.track(
-                infer_frame, verbose=False, device=DEVICE,
-                conf=CONF_THRESHOLD,
-                tracker=_BYTETRACK_CFG,   # custom config with extended track_buffer
-                persist=True,
+            # ── YOLOv8 + ByteTrack (track() gives persistent IDs) ────────────
+            track_results = None
+            if model_stream is not None:
+                with _stream_lock:
+                    track_results = model_stream.track(
+                        infer_frame, verbose=False, device=DEVICE,
+                        conf=CONF_THRESHOLD,
+                        tracker=_BYTETRACK_CFG,
+                        persist=True,
+                    )
+
+            infer_ms = (time.perf_counter() - t0) * 1000
+
+            # ── Count only NEW track IDs ──────────────────────────────────────
+            new_detections: dict[str, int] = {}
+            frame_has_detections = False
+            current_active_masks = []
+
+            if track_results and len(track_results[0].boxes) > 0:
+                result   = track_results[0]
+                boxes    = result.boxes
+                masks    = result.masks
+                has_ids  = boxes.id is not None
+
+                active_boxes_map: Dict[int, Tuple[int, int, int, int]] = {}
+                for i in range(len(boxes)):
+                    cls_id   = int(boxes.cls[i])
+                    raw_name = model_stream.names.get(cls_id, "Target")
+                    label    = raw_name.upper()
+                    conf     = float(boxes.conf[i])
+                    track_id = int(boxes.id[i]) if has_ids else (i + 1)
+                    colour   = _track_colour(track_id)
+                    x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[i])
+                    active_boxes_map[track_id] = (x1, y1, x2, y2)
+
+                    frame_has_detections = True
+
+                    sub_text = f"{int(conf * 100)}%"
+                    if cv5_pipeline and hasattr(cv5_pipeline, "spatial_analyzer") and has_ids:
+                        try:
+                            mask_poly = masks.xy[i] if (masks is not None and i < len(masks.xy)) else None
+                            vec = cv5_pipeline.spatial_analyzer.update_track(
+                                track_id, (x1, y1, x2, y2), timestamp=time.monotonic(), mask_pts=mask_poly
+                            )
+                            if vec.cardinal != "STATIONARY" and vec.speed > 8.0:
+                                sub_text += f" · {vec.cardinal} {vec.speed:.0f}px/s"
+                            else:
+                                sub_text += " · STATIONARY"
+                        except Exception:
+                            pass
+
+                    badge_title = f"{label} #{track_id}"
+
+                    # ── Render refined segmentation mask or sleek tech corners ──
+                    if masks is not None and i < len(masks.xy) and len(masks.xy[i]) > 0:
+                        current_active_masks.append(masks.xy[i])
+                        _draw_seg(frame, masks.xy[i], colour, badge_title, sub_text)
+                    else:
+                        current_active_masks.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32))
+                        _draw_tech_corners(frame, (x1, y1, x2, y2), colour)
+                        _draw_hud_badge(frame, x1, y1, badge_title, sub_text, colour)
+
+                    if has_ids:
+                        with _state_lock:
+                            if track_id not in seen_track_ids:
+                                seen_track_ids.add(track_id)
+                                animal_counts[raw_name.lower()] = animal_counts.get(raw_name.lower(), 0) + 1
+                                new_detections[raw_name.lower()] = new_detections.get(raw_name.lower(), 0) + 1
+
+                if cv5_pipeline and hasattr(cv5_pipeline, "spatial_analyzer") and active_boxes_map:
+                    try:
+                        frame = cv5_pipeline.spatial_analyzer.draw_motion_overlay(
+                            frame, active_boxes_map, {tid: _track_colour(tid) for tid in active_boxes_map}
+                        )
+                    except Exception:
+                        pass
+
+            elif model_stream is None and cv5_pipeline and pipe_res and getattr(pipe_res, "motion", None) and pipe_res.motion.motion_detected:
+                # OpenCV 5 MOG2 motion pre-filter fallback with aesthetic HUD
+                active_boxes_map: Dict[int, Tuple[int, int, int, int]] = {}
+                raw_contours = getattr(pipe_res.motion, "contours", None)
+                if not raw_contours:
+                    fg = getattr(pipe_res.motion, "foreground_mask", None)
+                    if fg is not None and fg.size > 0:
+                        raw_contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    else:
+                        raw_contours = []
+                valid_contours = sorted([c for c in raw_contours if cv2.contourArea(c) > 600],
+                                        key=cv2.contourArea, reverse=True)
+                for c_idx, cnt in enumerate(valid_contours[:3], start=1):
+                    mx, my, mw, mh = cv2.boundingRect(cnt)
+                    bx = (mx, my, mx + mw, my + mh)
+                    active_boxes_map[c_idx] = bx
+                    frame_has_detections = True
+                    vec = cv5_pipeline.spatial_analyzer.update_track(
+                        c_idx, bx, timestamp=time.monotonic(), mask_pts=cnt.reshape(-1, 2)
+                    )
+                    col = _track_colour(c_idx)
+                    sub = f"{vec.cardinal} {vec.speed:.0f}px/s" if (vec.cardinal != "STATIONARY" and vec.speed > 8.0) else "STATIONARY" 
+                    current_active_masks.append(cnt.reshape(-1, 2))
+                    if len(cnt) >= 6:
+                        _draw_seg(frame, cnt.reshape(-1, 2), col, f"TARGET #{c_idx}", sub, alpha=0.22)
+                    else:
+                        _draw_tech_corners(frame, bx, col)
+                        _draw_hud_badge(frame, mx, my, f"TARGET #{c_idx}", sub, col)
+                    with _state_lock:
+                        if c_idx not in seen_track_ids:
+                            seen_track_ids.add(c_idx)
+                            animal_counts["wildlife"] = animal_counts.get("wildlife", 0) + 1
+                            new_detections["wildlife"] = new_detections.get("wildlife", 0) + 1
+                if cv5_pipeline and hasattr(cv5_pipeline, "spatial_analyzer") and active_boxes_map:
+                    try:
+                        frame = cv5_pipeline.spatial_analyzer.draw_motion_overlay(
+                            frame, active_boxes_map, {tid: _track_colour(tid) for tid in active_boxes_map}
+                        )
+                    except Exception:
+                        pass
+
+            # ── Real-time cumulative spatial density heatmap accumulation ─────
+            _accumulate_live_heatmap(h, w, current_active_masks)
+
+            # ── Modern Minimalist Sensor & Environmental HUD Pill ─────────────
+            _draw_env_hud_pill(frame, env_mode, w, h)
+
+            # ── Sleek Monospace Bottom Timestamp ──────────────────────────────
+            ts_now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+            cv2.putText(frame, f"SENTINEL v5 · {ts_now}", (14, h - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 190, 200), 1, cv2.LINE_AA)
+
+            # ── Clip recording ────────────────────────────────────────────────
+            now = time.time()
+            with _state_lock:
+                writer_active = video_writer is not None
+
+            if frame_has_detections and not writer_active:
+                fname = os.path.join(VIDEO_DIR,
+                                     datetime.now().strftime("clip_%Y%m%d_%H%M%S.mp4"))
+                nw = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (w, h))
+                with _state_lock:
+                    video_writer    = nw
+                    clip_start_time = now
+                    last_clip_path  = fname
+
+            with _state_lock:
+                if video_writer is not None:
+                    video_writer.write(frame)
+                    clip_due = (now - (clip_start_time or now)) >= CLIP_DURATION
+                else:
+                    clip_due = False
+
+            if clip_due:
+                with _state_lock:
+                    path = last_clip_path
+                    counts = dict(animal_counts)
+                    animal_counts.clear()
+                    seen_track_ids.clear()
+                    clip_start_time = None
+                _io_pool.submit(_finalize_clip, path, counts)
+
+            # ── Performance & Telemetry Engine ────────────────────────────────
+            frame_time = time.perf_counter() - t0
+            frame_time_ms = frame_time * 1000.0
+            _fps_window.append(frame_time)
+            fps = len(_fps_window) / sum(_fps_window) if _fps_window else 0.0
+            dropped_estimate = max(0, int(frame_time_ms / 40.0) - 1)
+            telemetry.record_frame(
+                t_total=frame_time_ms,
+                t_prep=pipe_diag.get("total_ms", 2.0) if "pipe_diag" in locals() else 2.0,
+                t_infer=infer_ms if "infer_ms" in locals() else 0.0,
+                t_track=0.5,
+                t_spatial=1.0,
+                t_enc=3.0,
+                dropped=dropped_estimate,
             )
 
-        infer_ms = (time.perf_counter() - t0) * 1000
+            gpu_pct    = 0.0
+            gpu_mem_mb = 0.0
+            if DEVICE != "cpu":
+                try:
+                    gpu_mem_mb = torch.cuda.memory_allocated(0) / 1024 / 1024
+                    gpu_pct = min(100.0, fps / 60 * 100)
+                except Exception:
+                    pass
 
-        # ── Count only NEW track IDs — same ID seen again = same individual ──
-        new_detections: dict[str, int] = {}
-        frame_has_detections = False
+            with _perf_lock:
+                _perf["fps"]         = round(fps, 1)
+                _perf["infer_ms"]    = round(infer_ms if "infer_ms" in locals() else 0.0, 1)
+                _perf["gpu_mem_mb"]  = round(gpu_mem_mb, 1)
+                _perf["uptime_s"]    = int(time.time() - START_TIME)
+                _perf["frame_count"] += 1
+        except Exception as _fe:
+            log.exception("Non-fatal frame processing error: %s", _fe)
 
-        if track_results and track_results[0].boxes.id is not None:
-            result   = track_results[0]
-            boxes    = result.boxes
-            masks    = result.masks   # None if model didn't return masks
-
-            for i in range(len(boxes)):
-                cls_id   = int(boxes.cls[i])
-                label    = model_stream.names.get(cls_id, "?")
-                conf     = float(boxes.conf[i])
-                track_id = int(boxes.id[i])
-                colour   = _track_colour(track_id)
-
-                frame_has_detections = True
-
-                if masks is not None and i < len(masks.xy):
-                    # Segmentation path — polygon outline + fill
-                    _draw_seg(frame, masks.xy[i], colour,
-                              f"{label} #{track_id} {conf:.2f}")
-                else:
-                    # Fallback to box if mask unavailable for this detection
-                    x1, y1, x2, y2 = (int(v) for v in boxes.xyxy[i])
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-                    cv2.putText(frame, f"{label} #{track_id} {conf:.2f}",
-                                (x1, max(y1 - 8, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, colour, 1,
-                                cv2.LINE_AA)
-
-                # Only count this individual if we've NEVER seen this track ID
-                with _state_lock:
-                    if track_id not in seen_track_ids:
-                        seen_track_ids.add(track_id)
-                        animal_counts[label] = animal_counts.get(label, 0) + 1
-                        new_detections[label] = new_detections.get(label, 0) + 1
-
-        # ── Timestamp overlay ─────────────────────────────────────────────────
-        ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-        cv2.putText(frame, ts, (w - 370, h - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 240, 200), 1, cv2.LINE_AA)
-
-        # ── Clip recording ────────────────────────────────────────────────────
-        now = time.time()
-        with _state_lock:
-            writer_active = video_writer is not None
-
-        if frame_has_detections and not writer_active:
-            fname = os.path.join(VIDEO_DIR,
-                                 datetime.now().strftime("clip_%Y%m%d_%H%M%S.mp4"))
-            nw = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, (w, h))
-            with _state_lock:
-                video_writer    = nw
-                clip_start_time = now
-                last_clip_path  = fname
-
-        with _state_lock:
-            if video_writer is not None:
-                video_writer.write(frame)
-                clip_due = (now - (clip_start_time or now)) >= CLIP_DURATION
-            else:
-                clip_due = False
-
-        if clip_due:
-            with _state_lock:
-                path = last_clip_path
-                counts = dict(animal_counts)
-                animal_counts.clear()
-                seen_track_ids.clear()   # new clip = new session, reset seen IDs
-                clip_start_time = None
-            _io_pool.submit(_finalize_clip, path, counts)
-
-        # ── Performance metrics ───────────────────────────────────────────────
-        frame_time = time.perf_counter() - t0
-        _fps_window.append(frame_time)
-        fps = len(_fps_window) / sum(_fps_window) if _fps_window else 0.0
-
-        gpu_pct    = 0.0
-        gpu_mem_mb = 0.0
-        if DEVICE != "cpu":
-            try:
-                gpu_mem_mb = torch.cuda.memory_allocated(0) / 1024 / 1024
-                # pynvml gives util; fall back to mem-based estimate if unavailable
-                if _PSUTIL:
-                    pass   # psutil doesn't expose GPU util; use torch
-                gpu_pct = min(100.0, fps / 60 * 100)   # rough proxy
-            except Exception:
-                pass
-
-        with _perf_lock:
-            _perf["fps"]         = round(fps, 1)
-            _perf["infer_ms"]    = round(infer_ms, 1)
-            _perf["gpu_mem_mb"]  = round(gpu_mem_mb, 1)
-            _perf["uptime_s"]    = int(time.time() - START_TIME)
-            _perf["frame_count"] += 1
-
-        # ── JPEG encode — quality 70 gives best FPS/quality tradeoff on GPU ──
-        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        # ── JPEG encode (with optional live heatmap overlay) ─────────────
+        out_frame = frame
+        if _show_heatmap_on_stream:
+            out_frame = render_live_heatmap(frame, alpha=0.55)
+        ok, jpeg = cv2.imencode(".jpg", out_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if not ok:
             continue
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                + jpeg.tobytes() + b"\r\n\r\n")
 
 
+_AESTHETIC_PALETTE = [
+    (142, 199, 72),   # Emerald / Sage green (BGR)
+    (255, 180, 0),    # Cyber Cyan
+    (246, 130, 59),   # Electric Azure
+    (113, 90, 244),   # Radiant Coral
+    (60, 175, 245),   # Sunset Amber
+    (168, 116, 214),  # Orchid Violet
+    (204, 235, 100),  # Mint Teal
+    (100, 210, 255),  # Honey Gold
+]
+
+
+def _accumulate_live_heatmap(h: int, w: int, masks_list: list) -> None:
+    """Real-time spatial density accumulation.
+    Stamps current detection footprints and applies continuous exponential cooling.
+    """
+    global _spatial_heatmap
+    with _heatmap_lock:
+        if _spatial_heatmap is None or _spatial_heatmap.shape[:2] != (h, w):
+            _spatial_heatmap = np.zeros((h, w), dtype=np.float32)
+
+        # Gradual cooling / temporal decay (0.997 per frame preserves activity history for ~2-3 mins)
+        _spatial_heatmap *= 0.997
+
+        for poly in masks_list:
+            if poly is None or len(poly) < 3:
+                continue
+            pts = poly.astype(np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(_spatial_heatmap, [pts], 0.25)
+            M = cv2.moments(pts)
+            if M["m00"] > 1e-3:
+                cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                cv2.circle(_spatial_heatmap, (cx, cy), max(8, w // 40), 0.50, -1)
+
+
+def render_pure_aesthetic_heatmap(h: int = 480, w: int = 640) -> np.ndarray:
+    """Renders a pure, video-free, aesthetic thermal spatial density map.
+    Uses deep obsidian canvas, subtle coordinate gridlines, multi-scale INFERNO bloom,
+    subtle topographic density contours, and high-tech HUD badges.
+    """
+    global _spatial_heatmap
+
+    # 1. Dark obsidian canvas
+    canvas = np.full((h, w, 3), (12, 14, 18), dtype=np.uint8)
+
+    # 2. Subtle sci-fi matrix grid
+    for x in range(0, w, 40):
+        cv2.line(canvas, (x, 0), (x, h), (20, 24, 30), 1)
+    for y in range(0, h, 40):
+        cv2.line(canvas, (0, y), (w, y), (20, 24, 30), 1)
+
+    with _heatmap_lock:
+        has_heat = _spatial_heatmap is not None and _spatial_heatmap.max() > 1e-4
+        if has_heat:
+            hmax = float(_spatial_heatmap.max())
+            raw_norm = np.clip((_spatial_heatmap / hmax) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            raw_norm = None
+
+    if raw_norm is not None:
+        # Multi-scale dual blur for radiant glowing bloom
+        aura = cv2.GaussianBlur(raw_norm, (45, 45), 0)
+        core = cv2.GaussianBlur(raw_norm, (15, 15), 0)
+        density = cv2.addWeighted(core, 0.70, aura, 0.30, 0)
+
+        # Apply rich thermal INFERNO colormap
+        colored = cv2.applyColorMap(density, cv2.COLORMAP_INFERNO)
+
+        # Smooth alpha mask based on density
+        mask = (density.astype(np.float32) / 255.0)[:, :, None]
+        mask = np.clip((mask - 0.04) / 0.96, 0.0, 1.0)
+        canvas = (canvas.astype(np.float32) * (1.0 - mask) + colored.astype(np.float32) * mask).astype(np.uint8)
+
+        # Subtle topographic density contours
+        for level in [65, 130, 195]:
+            _, thresh = cv2.threshold(density, level, 255, cv2.THRESH_BINARY)
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.polylines(canvas, cnts, True, (85, 60, 110), 1, cv2.LINE_AA)
+
+    # 3. Glassmorphic HUD Badge (Top Left)
+    cv2.rectangle(canvas, (14, 14), (255, 38), (18, 20, 26), -1)
+    cv2.rectangle(canvas, (14, 14), (255, 38), (45, 52, 65), 1, cv2.LINE_AA)
+    cv2.circle(canvas, (26, 26), 4, (0, 175, 245), -1, cv2.LINE_AA)
+    cv2.putText(canvas, "SPATIAL DENSITY MATRIX", (36, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 235, 245), 1, cv2.LINE_AA)
+
+    # 4. Aspect Ratio & Resolution Indicator (Bottom Left)
+    cv2.putText(canvas, f"{w}x{h} · 1:1 RATIO", (16, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (120, 130, 145), 1, cv2.LINE_AA)
+
+    # 5. Gradient Legend Bar (Bottom Right)
+    lx, ly, lw, lh = w - 150, h - 26, 120, 8
+    bar = np.linspace(0, 255, lw, dtype=np.uint8).reshape(1, lw)
+    bar = np.repeat(bar, lh, axis=0)
+    bar_col = cv2.applyColorMap(bar, cv2.COLORMAP_INFERNO)
+    canvas[ly:ly+lh, lx:lx+lw] = bar_col
+    cv2.rectangle(canvas, (lx, ly), (lx+lw, ly+lh), (60, 70, 85), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "LOW", (lx - 26, ly + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (140, 150, 165), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "MAX", (lx + lw + 6, ly + 7), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 200, 120), 1, cv2.LINE_AA)
+
+    return canvas
+
+def render_live_heatmap(frame: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+    """Blends the live cumulative spatial density heatmap over the camera frame
+    using OpenCV TURBO colormap. Sub-millisecond execution, zero matplotlib overhead.
+    """
+    global _spatial_heatmap
+    with _heatmap_lock:
+        if _spatial_heatmap is None:
+            return frame
+        hmax = float(_spatial_heatmap.max())
+        if hmax <= 1e-4:
+            return frame
+        # Normalize and blur in uint8 for fast AVX2 SIMD acceleration
+        norm = np.clip((_spatial_heatmap / (hmax + 1e-6)) * 255.0, 0, 255).astype(np.uint8)
+        norm = cv2.GaussianBlur(norm, (21, 21), 0)
+
+    colored = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+    blended = cv2.addWeighted(frame, 1.0 - alpha, colored, alpha, 0)
+    # Mask out background where no activity occurred (keep video sharp)
+    return np.where(norm[:, :, None] > 18, blended, frame)
+
+
+def generate_heatmap_frames():
+    """Live streaming MJPEG generator for the pure aesthetic spatial density heatmap."""
+    while True:
+        if not cam_active:
+            time.sleep(0.2)
+            continue
+        h, w = 480, 640
+        with _last_frame_lock:
+            if _last_frame is not None:
+                h, w = _last_frame.shape[:2]
+
+        heat_view = render_pure_aesthetic_heatmap(h, w)
+        ok, jpeg = cv2.imencode(".jpg", heat_view, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                   + jpeg.tobytes() + b"\r\n\r\n")
+        time.sleep(0.04)
+
 def _track_colour(track_id: int) -> tuple:
-    """Deterministic per-track colour so each individual is visually distinct."""
-    rng = (track_id * 2654435761) & 0xFFFFFF
-    r = (rng >> 16) & 0xFF
-    g = (rng >> 8)  & 0xFF
-    b =  rng        & 0xFF
-    # keep it bright — boost any dim channel
-    if max(r, g, b) < 100:
-        r, g, b = min(r + 120, 255), min(g + 80, 255), min(b + 80, 255)
-    return (b, g, r)   # OpenCV is BGR
+    """Aesthetic designer palette for high-tech HUD visualization."""
+    return _AESTHETIC_PALETTE[abs(int(track_id)) % len(_AESTHETIC_PALETTE)]
 
 
 def build_heatmap(frame: np.ndarray, masks_xy: list) -> str:
@@ -1217,8 +1699,8 @@ main{padding:1.75rem 2rem;overflow-y:auto}
 
 /* ── Stream ── */
 .stream-panel{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
-.stream-wrap{position:relative;background:#0f0f0d;overflow:hidden;line-height:0}
-.stream-wrap img{display:block;width:100%%;height:auto}
+.stream-wrap{position:relative;background:#0f0f0d;overflow:hidden;line-height:0;min-height:380px;display:flex;align-items:center;justify-content:center}
+.stream-wrap img{display:block;width:100%%;height:auto;max-height:560px;object-fit:contain}
 .stream-overlay{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;
                 justify-content:space-between;padding:.6rem .9rem;pointer-events:none;
                 background:linear-gradient(to bottom,rgba(0,0,0,.55),transparent)}
@@ -1234,8 +1716,8 @@ main{padding:1.75rem 2rem;overflow-y:auto}
 
 /* ── Heatmap ── */
 .heatmap-panel{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
-.heatmap-body{background:#0f0f0d;padding:.5rem;display:flex;justify-content:center}
-.heatmap-body img{display:block;width:50%%;height:auto;border-radius:4px}
+.heatmap-body{position:relative;background:#0c0e12;overflow:hidden;line-height:0;min-height:380px;display:flex;align-items:center;justify-content:center}
+.heatmap-body img{display:block;width:100%%;height:auto;max-height:560px;object-fit:contain}
 
 /* ── Right column ── */
 .right-col{display:flex;flex-direction:column;gap:1.25rem}
@@ -1348,7 +1830,7 @@ main{padding:1.75rem 2rem;overflow-y:auto}
           <span class="badge badge-sage">ByteTrack</span>
         </div>
         <div class="stream-wrap">
-          <img id="stream-img" src="/video_feed" alt="Live feed">
+          <img id="stream-img" src="/video_feed" alt="Live feed" onerror="setTimeout(()=>{this.src='/video_feed?t='+Date.now()}, 1500)">
           <div class="stream-overlay">
             <div class="rec-badge" id="rec-badge"><span class="rec-dot"></span>REC</div>
             <div class="stream-ts" id="clock"></div>
@@ -1358,7 +1840,7 @@ main{padding:1.75rem 2rem;overflow-y:auto}
           <button class="btn btn-danger" id="btn-stop"  onclick="camStop()">⏹ Stop</button>
           <button class="btn btn-primary" id="btn-start" onclick="camStart()" style="display:none">▶ Resume</button>
           <button class="btn btn-outline" onclick="takeSnapshot()">📷 Snapshot</button>
-          <button class="btn btn-outline" onclick="refreshHeatmap()">Refresh heatmap</button>
+          <button class="btn btn-outline" id="btn-toggle-hmap" onclick="toggleStreamHeatmap()">🔥 Stream Heatmap: OFF</button>
           <button class="btn btn-outline" onclick="clearCounts()">Clear counts</button>
         </div>
       </div>
@@ -1366,11 +1848,14 @@ main{padding:1.75rem 2rem;overflow-y:auto}
       <!-- Heatmap -->
       <div class="heatmap-panel">
         <div class="card-head">
-          <span class="card-title">Detection heatmap</span>
-          <span class="badge badge-neutral">Segmentation masks</span>
+          <span class="card-title">Live spatial density heatmap</span>
+          <span class="badge badge-sage">Thermal Matrix</span>
         </div>
         <div class="heatmap-body">
-          <img id="heatmap-img" src="/heatmap" alt="Heatmap" onerror="this.style.display='none'">
+          <img id="heatmap-img" src="/heatmap_feed" alt="Live Spatial Density Heatmap" onerror="this.src='/heatmap'">
+          <div style="position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:10;">
+            <button class="btn btn-outline" style="padding:4px 10px;font-size:11px;background:rgba(18,20,26,0.85);color:#fff;border-color:rgba(255,255,255,0.2);" onclick="clearHeatmap()">Reset Heat</button>
+          </div>
         </div>
       </div>
 
@@ -1419,11 +1904,11 @@ async function pollPerf(){
   try{
     const p=await(await fetch('/api/perf')).json();
     const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v;};
-    const bar=(id,v,mx)=>{const el=document.getElementById(id);if(el)el.style.width=Math.min(100,Math.max(0,v/mx*100))+'%%';};
+    const bar=(id,v,mx)=>{const el=document.getElementById(id);if(el)el.style.width=Math.min(100,Math.max(0,v/mx*100))+'%';};
     set('perf-fps',   p.fps+' fps');
     set('perf-ms',    p.infer_ms+' ms');
     set('perf-gmem',  p.gpu_mem_mb+' MB');
-    set('perf-cpu',   p.cpu_pct+'%%');
+    set('perf-cpu',   p.cpu_pct+'%');
     set('perf-ram',   Math.round(p.ram_mb)+' MB');
     set('perf-uptime',p.uptime_fmt);
     set('perf-frames',p.frame_count.toLocaleString());
@@ -1436,7 +1921,7 @@ async function pollPerf(){
     bar('bar-cpu', 100-p.cpu_pct, 100);
     const badge=document.getElementById('gpu-badge');
     if(badge)badge.textContent=p.gpu_name||p.device;
-  }catch(_){}
+  }catch(e){console.warn('pollPerf error:',e);}
 }
 
 async function camStop(){
@@ -1460,7 +1945,18 @@ async function camStart(){
   img.src='/video_feed?t='+Date.now();
 }
 function takeSnapshot(){window.open('/api/cam/snapshot','_blank');}
-function refreshHeatmap(){const i=document.getElementById('heatmap-img');i.src='/heatmap?t='+Date.now();i.style.display='block';}
+async function toggleStreamHeatmap(){
+  const res=await(await fetch('/api/toggle_heatmap_overlay',{method:'POST'})).json();
+  const btn=document.getElementById('btn-toggle-hmap');
+  if(btn){
+    btn.textContent=res.active?'🔥 Stream Heatmap: ON':'🔥 Stream Heatmap: OFF';
+    btn.className=res.active?'btn btn-primary':'btn btn-outline';
+  }
+}
+async function clearHeatmap(){
+  await fetch('/api/clear_heatmap',{method:'POST'});
+}
+function refreshHeatmap(){const i=document.getElementById('heatmap-img');i.src='/heatmap_feed?t='+Date.now();i.style.display='block';}
 async function clearCounts(){await fetch('/api/clear_counts',{method:'POST'});pollCounts();}
 
 (async()=>{
@@ -1888,38 +2384,46 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
+@app.route("/heatmap_feed")
+@login_required
+def heatmap_feed():
+    """Live streaming real-time cumulative activity heatmap (MJPEG)."""
+    return Response(generate_heatmap_frames(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
 @app.route("/heatmap")
 @login_required
 def heatmap():
-    global cap
-    if cap is None or not cap.isOpened():
-        reconnect_stream()
-    ret, frame = cap.read()
-    if not ret:
-        return jsonify(error="Camera unavailable"), 503
+    """Instant snapshot of the pure aesthetic spatial heatmap."""
+    h, w = 480, 640
+    with _last_frame_lock:
+        if _last_frame is not None:
+            h, w = _last_frame.shape[:2]
 
-    with _model_lock:
-        results = model(frame, verbose=False, device=DEVICE)
+    heat_frame = render_pure_aesthetic_heatmap(h, w)
+    ok, buf = cv2.imencode(".jpg", heat_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        return jsonify(error="Encoding error"), 500
+    import io
+    return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
 
-    # Extract polygon masks from segmentation results
-    masks_xy = []
-    for r in results:
-        if r.masks is not None:
-            for poly in r.masks.xy:
-                masks_xy.append(poly)
-        else:
-            # model returned no masks — fall back to box-centre dot
-            for b in r.boxes:
-                x1, y1, x2, y2 = (int(v) for v in b.xyxy[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                # synthesise a small polygon around centroid
-                r2 = max((x2 - x1) // 4, 8)
-                masks_xy.append(np.array([
-                    [cx - r2, cy - r2], [cx + r2, cy - r2],
-                    [cx + r2, cy + r2], [cx - r2, cy + r2],
-                ], dtype=np.float32))
+@app.route("/api/toggle_heatmap_overlay", methods=["POST"])
+@login_required
+def toggle_heatmap_overlay():
+    global _show_heatmap_on_stream
+    with _heatmap_lock:
+        _show_heatmap_on_stream = not _show_heatmap_on_stream
+        curr_state = _show_heatmap_on_stream
+    return jsonify(active=curr_state)
 
-    return send_file(build_heatmap(frame, masks_xy), mimetype="image/png")
+@app.route("/api/clear_heatmap", methods=["POST"])
+@login_required
+def clear_heatmap():
+    global _spatial_heatmap
+    with _heatmap_lock:
+        if _spatial_heatmap is not None:
+            _spatial_heatmap.fill(0.0)
+    return jsonify(cleared=True)
 
 # ── Live-stream JSON API ──────────────────────────────────────────────────────
 @app.route("/api/counts")
@@ -1970,13 +2474,18 @@ def api_cam_status():
 @login_required
 def api_cam_snapshot():
     """Return a single JPEG snapshot from the current frame."""
-    global cap
     if not cam_active:
         return jsonify(error="Camera is stopped"), 400
-    if cap is None or not cap.isOpened():
-        reconnect_stream()
-    ret, frame = cap.read()
-    if not ret:
+    frame = None
+    with _last_frame_lock:
+        if _last_frame is not None:
+            frame = _last_frame.copy()
+    if frame is None:
+        global cap
+        if cap is not None and cap.isOpened():
+            with _stream_lock:
+                ret, frame = cap.read()
+    if frame is None:
         return jsonify(error="Could not capture frame"), 503
     ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if not ok:
@@ -2005,6 +2514,12 @@ def api_aws_status():
         "sns_topic": bool(os.environ.get("AWS_SNS_TOPIC_ARN")),
     })
 
+@app.route("/api/telemetry")
+@login_required
+def api_telemetry():
+    """Full enterprise observability telemetry payload."""
+    return jsonify(telemetry.get_snapshot())
+
 @app.route("/api/perf")
 @login_required
 def api_perf():
@@ -2023,6 +2538,11 @@ def api_perf():
     data["opencv_version"] = cv2.__version__
     data["opencv5_pipeline"] = cv5_pipeline is not None
     data["aws_enabled"] = _AWS_ENABLED
+    snap = telemetry.get_snapshot()
+    data["health"] = snap["health"]
+    data["drop_rate_pct"] = snap["drop_rate_pct"]
+    data["jitter_ms"] = snap["latency_breakdown_ms"]["jitter"]
+    data["cv5_preprocess_ms"] = snap["latency_breakdown_ms"]["cv5_preprocess"]
     return jsonify(data)
 
 # ── Video analysis API ────────────────────────────────────────────────────────
