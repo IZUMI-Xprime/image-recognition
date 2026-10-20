@@ -30,6 +30,7 @@ torchvision>=0.15.0
 
 # Production WSGI server
 gunicorn>=21.2.0,<24.0.0
+waitress>=3.0.0
 
 # Cython accelerated tracker (optional build-time dependency)
 cython>=3.0.0,<4.0.0

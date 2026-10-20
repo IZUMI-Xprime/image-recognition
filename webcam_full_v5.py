@@ -798,19 +798,59 @@ def _analyse_video(job_id: str, video_path: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Camera / live stream
 # ─────────────────────────────────────────────────────────────────────────────
-def reconnect_stream(retries=5, delay=2.0):
-    global cap
-    for attempt in range(retries):
-        if cap is not None:
-            cap.release()
-        cap = cv2.VideoCapture(0)
+_is_synthetic_feed = False
+
+def _generate_synthetic_wildlife_frame(fc: int, h: int = 480, w: int = 640) -> np.ndarray:
+    """Generates an organic synthetic camera-trap patrol frame for cloud hosts lacking physical webcams."""
+    canvas = np.full((h, w, 3), (32, 38, 35), dtype=np.uint8)
+    for y in range(0, h, 24):
+        cv2.line(canvas, (0, y), (w, y), (28, 33, 30), 1)
+    t = fc * 0.04
+    cx = int(w * 0.5 + (w * 0.28) * np.sin(t))
+    cy = int(h * 0.55 + 25 * np.cos(t * 1.5))
+    cv2.ellipse(canvas, (cx, cy), (48, 28), 0, 0, 360, (70, 85, 75), -1)
+    cv2.circle(canvas, (cx + 36, cy - 18), 16, (72, 88, 78), -1)
+    cv2.line(canvas, (cx - 24, cy + 20), (cx - 28, cy + 55), (65, 80, 70), 3)
+    cv2.line(canvas, (cx + 24, cy + 20), (cx + 28, cy + 55), (65, 80, 70), 3)
+    cv2.putText(canvas, "CLOUD PATROL FEED [HEADLESS HOST]", (14, h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 160, 120), 1, cv2.LINE_AA)
+    return canvas
+
+def reconnect_stream(retries=3, delay=1.0):
+    global cap, _is_synthetic_feed
+    if cap is not None:
+        try: cap.release()
+        except Exception: pass
+
+    source = os.environ.get("VIDEO_SOURCE", "0")
+    try:
+        dev_id = int(source)
+        cap = cv2.VideoCapture(dev_id)
         if cap.isOpened():
-            log.info("Camera connected.")
+            log.info("Physical camera (index %d) connected.", dev_id)
+            _is_synthetic_feed = False
             return True
-        log.warning("Webcam retry %d/%d", attempt + 1, retries)
-        time.sleep(delay)
-    log.error("Failed to open webcam.")
-    return False
+    except (ValueError, TypeError):
+        if os.path.exists(source) or source.startswith(("http://", "https://", "rtsp://")):
+            cap = cv2.VideoCapture(source)
+            if cap.isOpened():
+                log.info("Video stream connected: %s", source)
+                _is_synthetic_feed = False
+                return True
+
+    vdir = os.path.abspath(VIDEO_DIR)
+    if os.path.exists(vdir):
+        vfiles = [os.path.join(vdir, f) for f in os.listdir(vdir) if f.endswith((".mp4", ".avi"))]
+        if vfiles:
+            cap = cv2.VideoCapture(vfiles[0])
+            if cap.isOpened():
+                log.info("Headless Cloud Mode: Looping sample video feed '%s'", os.path.basename(vfiles[0]))
+                _is_synthetic_feed = False
+                return True
+
+    log.info("Headless Cloud Mode: Physical webcam not found. Activating synthetic wildlife perception feed.")
+    _is_synthetic_feed = True
+    return True
 
 
 def _send_email(counts: dict) -> None:
@@ -1071,13 +1111,21 @@ def generate_frames():
             time.sleep(0.1)
             continue
 
-        # ── Camera feed ───────────────────────────────────────────────────────
-        if cap is None or not cap.isOpened():
-            reconnect_stream(); time.sleep(0.1); continue
+        # ── Camera feed / Headless Cloud fallback ─────────────────────────────
+        if _is_synthetic_feed:
+            frame = _generate_synthetic_wildlife_frame(frame_count)
+            time.sleep(0.04)
+        else:
+            if cap is None or not cap.isOpened():
+                reconnect_stream(); time.sleep(0.1); continue
 
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            reconnect_stream(); continue
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                if cap is not None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                if not ret or frame is None:
+                    reconnect_stream(); continue
 
         # Thread-safe copy for secondary endpoints (/heatmap, /snapshot)
         with _last_frame_lock:

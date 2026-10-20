@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: wildlife-sentinel
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 5000
+      - key: USE_WAITRESS
+        value: "1"
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        value: SentinelSecure2026!
+      - key: CONF_THRESHOLD
+        value: "0.40"
+      - key: IOU_THRESHOLD
+        value: "0.35"
