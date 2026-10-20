@@ -1,5 +1,5 @@
 """
-Wildlife Sentinel v5
+Wildlife Sentinel v5 — OpenCV AI Competition 2026
 ====================
 New in v5: 
   • Analysis job survives page reload — job_id stored in localStorage, auto-resumes on return
@@ -30,7 +30,10 @@ import cv2
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 import torch
 from flask import (Flask, Response, jsonify, redirect,
                    render_template_string, request, send_file,
@@ -83,6 +86,26 @@ except ImportError:
                 "Run:  python setup_tracker.py build_ext --inplace")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OpenCV 5 & AWS Integration (OpenCV AI Competition 2026)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import opencv5_features as _cv5
+    _CV5_OK = True
+    log.info("OpenCV 5 module loaded: OpenCV %s (major=%d)", _cv5._CV_VERSION, _cv5._CV_MAJOR)
+except Exception as _e:
+    _CV5_OK = False
+    _cv5 = None
+    log.warning("opencv5_features module not available: %s", _e)
+
+try:
+    import aws_integration as _aws
+    _AWS_OK = True
+except Exception as _e:
+    _AWS_OK = False
+    _aws = None
+    log.warning("aws_integration module not available: %s", _e)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 def _env(key: str) -> str:
@@ -116,6 +139,45 @@ FRAME_SKIP        = int(os.environ.get("FRAME_SKIP",         "3"))
 # At 8-9 fps, 90 frames = ~10 seconds before an individual is "forgotten"
 # Increase this if the same person re-entering is being counted twice
 TRACK_BUFFER      = int(os.environ.get("TRACK_BUFFER", "90"))
+
+# ── OpenCV 5 Enhanced Pipeline ───────────────────────────────────────────────
+ENABLE_CV5_PIPELINE = os.environ.get("OPENCV5_PIPELINE", "true").lower() in ("true", "1", "yes")
+ENABLE_CV5_CLAHE    = os.environ.get("OPENCV5_CLAHE", "true").lower() in ("true", "1", "yes")
+ENABLE_CV5_DENOISE  = os.environ.get("OPENCV5_DENOISE", "false").lower() in ("true", "1", "yes")
+ENABLE_CV5_BG_SUB   = os.environ.get("OPENCV5_BG_SUBTRACT", "true").lower() in ("true", "1", "yes")
+ENABLE_CV5_STABILIZE= os.environ.get("OPENCV5_STABILIZE", "false").lower() in ("true", "1", "yes")
+
+cv5_pipeline = None
+if _CV5_OK and ENABLE_CV5_PIPELINE:
+    try:
+        cv5_pipeline = _cv5.OpenCV5Pipeline(
+            enable_motion_filter=ENABLE_CV5_BG_SUB,
+            enable_stabilisation=ENABLE_CV5_STABILIZE,
+            enable_denoise=ENABLE_CV5_DENOISE,
+            enable_clahe=ENABLE_CV5_CLAHE,
+            enable_edge_preserve=False,
+            enable_tracking=False,
+            enable_reid=True,
+        )
+        log.info("OpenCV 5 pipeline active: CLAHE=%s, BgSub=%s, Denoise=%s, Stabilize=%s",
+                 ENABLE_CV5_CLAHE, ENABLE_CV5_BG_SUB, ENABLE_CV5_DENOISE, ENABLE_CV5_STABILIZE)
+    except Exception as _pe:
+        log.warning("OpenCV 5 pipeline initialization failed: %s", _pe)
+
+# ── AWS Cloud Backend ────────────────────────────────────────────────────────
+USE_AWS = os.environ.get("USE_AWS", "false").lower() in ("true", "1", "yes")
+_AWS_ENABLED = False
+if _AWS_OK and USE_AWS:
+    try:
+        _AWS_ENABLED = _aws.init_aws()
+        if _AWS_ENABLED:
+            log.info("AWS integration enabled and initialized successfully.")
+        else:
+            log.info("AWS integration initialized in passive mode (check AWS credentials).")
+    except Exception as _ae:
+        log.warning("AWS initialization failed: %s", _ae)
+else:
+    log.info("AWS integration: local-only mode (set USE_AWS=true in .env to enable cloud features).")
 
 os.makedirs(VIDEO_DIR,  exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -489,6 +551,25 @@ def _analyse_video(job_id: str, video_path: str) -> None:
             caption = "\n".join(caption_lines)
             _io_pool.submit(_send_telegram_video, out_path, caption)
 
+        # ── AWS Cloud Archival for Video Analysis ─────────────────────────
+        if _AWS_ENABLED and _aws is not None and os.path.exists(out_path):
+            try:
+                s3_key = f"analysis/analysed_{job_id}.mp4"
+                s3_url = _aws.upload_to_s3(out_path, s3_key)
+                with _jobs_lock:
+                    _jobs[job_id]["s3_url"] = s3_url
+                _aws.log_detection_event({
+                    "job_id": job_id,
+                    "species": job_counts,
+                    "total_unique": sum(job_counts.values()),
+                    "frames_analysed": frames_done,
+                    "s3_url": s3_url,
+                    "source": "video_analysis",
+                })
+                log.info("Analysis video uploaded to S3: %s", s3_url)
+            except Exception as _aerr:
+                log.error("AWS analysis upload failed: %s", _aerr)
+
     except Exception as exc:
         log.exception("Job %s failed", job_id)
         with _jobs_lock:
@@ -603,6 +684,28 @@ def _finalize_clip(video_path, counts):
     _send_telegram(video_path)
     _send_email(counts)
 
+    # ── AWS S3 + DynamoDB Archival ────────────────────────────────────────
+    if _AWS_ENABLED and _aws is not None:
+        try:
+            s3_key = f"clips/{os.path.basename(video_path)}"
+            s3_url = _aws.upload_to_s3(video_path, s3_key)
+            log.info("Clip uploaded to S3: %s", s3_url)
+            event_payload = {
+                "species": counts,
+                "total_unique": sum(counts.values()),
+                "clip_file": os.path.basename(video_path),
+                "s3_url": s3_url,
+                "source": "live_stream",
+            }
+            _aws.log_detection_event(event_payload)
+            if os.environ.get("AWS_SNS_ALERTS", "false").lower() in ("true", "1", "yes"):
+                _aws.send_sns_alert(
+                    "Wildlife Sentinel: Animal Detected",
+                    f"Detections: {counts}\nClip S3 URL: {s3_url}",
+                )
+        except Exception as _aerr:
+            log.error("AWS clip upload/logging failed: %s", _aerr)
+
 
 def _draw_seg(frame: np.ndarray,
               mask_xy: np.ndarray,
@@ -691,10 +794,19 @@ def generate_frames():
         h, w  = frame.shape[:2]
         t0    = time.perf_counter()
 
+        # ── OpenCV 5 Preprocessing (CLAHE, motion detection, denoising) ──────
+        infer_frame = frame
+        if cv5_pipeline is not None:
+            try:
+                pipe_res = cv5_pipeline.process(frame)
+                infer_frame = pipe_res.frame
+            except Exception:
+                infer_frame = frame
+
         # ── YOLOv8 + ByteTrack (track() gives persistent IDs) ────────────────
         with _stream_lock:
             track_results = model_stream.track(
-                frame, verbose=False, device=DEVICE,
+                infer_frame, verbose=False, device=DEVICE,
                 conf=CONF_THRESHOLD,
                 tracker=_BYTETRACK_CFG,   # custom config with extended track_buffer
                 persist=True,
@@ -1151,6 +1263,8 @@ main{padding:1.75rem 2rem;overflow-y:auto}
     <a href="/recordings" class="nav-link">Recordings</a>
   </div>
   <div class="nav-right">
+    <span class="badge badge-sage" id="cv5-badge">OpenCV 5</span>
+    <span class="badge badge-neutral" id="aws-badge">AWS Local</span>
     <span class="device-pill" id="gpu-badge">{{ device }}</span>
     <div class="nav-sep"></div>
     <a href="/logout" class="nav-logout">Sign out</a>
@@ -1312,6 +1426,8 @@ async function pollPerf(){
     set('perf-uptime',p.uptime_fmt);
     set('perf-frames',p.frame_count.toLocaleString());
     set('perf-tracker',p.cython?'Cython':'Pure Python');
+    const awsEl=document.getElementById('aws-badge');if(awsEl){awsEl.textContent=p.aws_enabled?'AWS Active':'AWS Local';awsEl.className=p.aws_enabled?'badge badge-sage':'badge badge-neutral';}
+    const cvEl=document.getElementById('cv5-badge');if(cvEl){cvEl.textContent='OpenCV '+(p.opencv_version||"5.x")+(p.opencv5_pipeline?' (Pipe)':'');}
     bar('bar-fps', p.fps, 30);
     bar('bar-ms',  Math.max(0,200-p.infer_ms), 200);
     bar('bar-gmem',p.gpu_mem_mb, 4096);
@@ -1864,6 +1980,25 @@ def api_cam_snapshot():
                              f'attachment; filename="snapshot_{int(time.time())}.jpg"'})
 
 # ── Performance metrics ───────────────────────────────────────────────────────
+@app.route("/api/opencv/status")
+@login_required
+def api_opencv_status():
+    if _cv5 is not None:
+        return jsonify(_cv5.report_opencv_info())
+    return jsonify({"version": cv2.__version__, "features": {}, "status": "standalone"})
+
+@app.route("/api/aws/status")
+@login_required
+def api_aws_status():
+    return jsonify({
+        "enabled": _AWS_ENABLED,
+        "configured": _AWS_OK and USE_AWS,
+        "region": os.environ.get("AWS_REGION", "us-east-1"),
+        "s3_bucket": os.environ.get("AWS_S3_BUCKET", ""),
+        "dynamodb_table": os.environ.get("AWS_DYNAMODB_TABLE", ""),
+        "sns_topic": bool(os.environ.get("AWS_SNS_TOPIC_ARN")),
+    })
+
 @app.route("/api/perf")
 @login_required
 def api_perf():
@@ -1879,6 +2014,9 @@ def api_perf():
     uptime           = int(data["uptime_s"])
     h, m, s          = uptime // 3600, (uptime % 3600) // 60, uptime % 60
     data["uptime_fmt"] = f"{h:02d}:{m:02d}:{s:02d}"
+    data["opencv_version"] = cv2.__version__
+    data["opencv5_pipeline"] = cv5_pipeline is not None
+    data["aws_enabled"] = _AWS_ENABLED
     return jsonify(data)
 
 # ── Video analysis API ────────────────────────────────────────────────────────

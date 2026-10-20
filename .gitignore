@@ -27,3 +27,19 @@ bytetrack_sentinel.yaml
 # IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# AWS local config (keep .env.example)
+.aws/
+
+# Model weights (auto-downloaded)
+*.pt
+!yolov8*.pt
