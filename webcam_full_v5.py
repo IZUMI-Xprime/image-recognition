@@ -119,6 +119,8 @@ TELEGRAM_CHAT_ID  = _env("TELEGRAM_CHAT_ID")
 
 ADMIN_USERNAME    = os.environ.get("ADMIN_USERNAME", "admin")
 _RAW_PASS         = os.environ.get("ADMIN_PASSWORD", "password123")
+if _RAW_PASS == "password123":
+    log.warning("SECURITY ADVISORY: Running with default ADMIN_PASSWORD ('password123')! Set a unique ADMIN_PASSWORD in your .env file for production deployments.")
 ADMIN_PASS_HASH   = hashlib.sha256(_RAW_PASS.encode()).hexdigest()
 
 CLIP_DURATION     = int(os.environ.get("CLIP_DURATION",   "60"))
@@ -1871,8 +1873,12 @@ def recordings():
 @login_required
 def download_file(filename: str):
     safe = secure_filename(filename)
-    path = os.path.join(VIDEO_DIR, safe)
-    if not os.path.exists(path):
+    base = os.path.abspath(VIDEO_DIR)
+    path = os.path.abspath(os.path.join(base, safe))
+    # Strict path traversal defense-in-depth verification
+    if not (path.startswith(base + os.sep) or path == base):
+        return jsonify(error="Access denied"), 403
+    if not os.path.exists(path) or not os.path.isfile(path):
         return jsonify(error="File not found"), 404
     return send_file(path, as_attachment=True)
 
