@@ -51,6 +51,7 @@ except ImportError:
     YOLO = None
     _YOLO_OK = False
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
     import psutil
@@ -129,10 +130,35 @@ TELEGRAM_TOKEN    = _env("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = _env("TELEGRAM_CHAT_ID")
 
 ADMIN_USERNAME    = os.environ.get("ADMIN_USERNAME", "admin")
-_RAW_PASS         = os.environ.get("ADMIN_PASSWORD", "password123")
-if _RAW_PASS == "password123":
-    log.warning("SECURITY ADVISORY: Running with default ADMIN_PASSWORD ('password123')! Set a unique ADMIN_PASSWORD in your .env file for production deployments.")
-ADMIN_PASS_HASH   = hashlib.sha256(_RAW_PASS.encode()).hexdigest()
+_RAW_PASS         = os.environ.get("ADMIN_PASSWORD")
+if not _RAW_PASS or _RAW_PASS == "password123":
+    _RAW_PASS = os.environ.get("ADMIN_PASSWORD", "SentinelSecure2026!")
+    log.warning("SECURITY ADVISORY: ADMIN_PASSWORD configured to '%s'. Set a custom ADMIN_PASSWORD in your .env file for production deployments.", _RAW_PASS)
+ADMIN_PASS_HASH   = generate_password_hash(_RAW_PASS)
+
+# Rate limiting for brute-force protection
+_login_lock = threading.Lock()
+_login_failures = {}
+_MAX_FAILURES = 5
+_LOCKOUT_SEC = 60
+
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    with _login_lock:
+        fails = [t for t in _login_failures.get(ip, []) if now - t < _LOCKOUT_SEC]
+        _login_failures[ip] = fails
+        return len(fails) >= _MAX_FAILURES
+
+def _record_failure(ip: str):
+    now = time.time()
+    with _login_lock:
+        if ip not in _login_failures:
+            _login_failures[ip] = []
+        _login_failures[ip].append(now)
+
+def _record_success(ip: str):
+    with _login_lock:
+        _login_failures.pop(ip, None)
 
 CLIP_DURATION     = int(os.environ.get("CLIP_DURATION",   "60"))
 EMAIL_COOLDOWN    = int(os.environ.get("EMAIL_COOLDOWN",   "60"))
@@ -220,6 +246,14 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=3600,
     # MAX_CONTENT_LENGTH intentionally NOT set — chunked streaming handles size
 )
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global JSON error handlers — Flask's defaults return HTML which breaks fetch()
@@ -2319,15 +2353,20 @@ def welcome():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
+    ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
     if request.method == "POST":
+        if _is_rate_limited(ip):
+            log.warning("Login brute-force lockout triggered for IP: %s", ip)
+            return render_template_string(LOGIN_HTML, error="Too many failed login attempts. Please wait 60 seconds."), 429
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        pw_hash  = hashlib.sha256(password.encode()).hexdigest()
         if (hmac.compare_digest(username, ADMIN_USERNAME) and
-                hmac.compare_digest(pw_hash, ADMIN_PASS_HASH)):
+                check_password_hash(ADMIN_PASS_HASH, password)):
+            _record_success(ip)
             session.permanent = True
             session["user"] = username
             return redirect(url_for("dashboard"))
+        _record_failure(ip)
         error = "Invalid credentials."
     return render_template_string(LOGIN_HTML, error=error)
 
@@ -2570,13 +2609,21 @@ def api_analyse_upload():
     job_id    = uuid.uuid4().hex
     save_path = os.path.join(UPLOAD_DIR, f"upload_{job_id}{ext}")
 
-    # Stream to disk
+    # Stream to disk with DoS size cap (500 MB)
+    MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+    total_bytes = 0
     try:
         with open(save_path, "wb") as out:
             while True:
                 chunk = f.stream.read(CHUNK_SIZE)
                 if not chunk:
                     break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    out.close()
+                    try: os.remove(save_path)
+                    except OSError: pass
+                    return jsonify(error="Uploaded video exceeds 500 MB security limit."), 413
                 out.write(chunk)
     except Exception as exc:
         log.error("Upload write failed: %s", exc)
@@ -2630,4 +2677,15 @@ def api_analyse_download(job_id: str):
 if __name__ == "__main__":
     reconnect_stream()
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    app.run(debug=debug, host="0.0.0.0", port=5000, threaded=True)
+    port = int(os.environ.get("PORT", "5000"))
+    use_waitress = os.environ.get("USE_WAITRESS", "1") == "1"
+    if use_waitress and not debug:
+        try:
+            from waitress import serve
+            log.info("Starting hardened production WSGI server (Waitress) on http://0.0.0.0:%d", port)
+            serve(app, host="0.0.0.0", port=port, threads=8)
+        except Exception as wsgi_err:
+            log.warning("Waitress fallback (%s), using Flask development server", wsgi_err)
+            app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
+    else:
+        app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)

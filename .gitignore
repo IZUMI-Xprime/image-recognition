@@ -43,3 +43,6 @@ env/
 # Model weights (auto-downloaded)
 *.pt
 !yolov8*.pt
+
+cloudflared.exe
+
